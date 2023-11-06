@@ -25,6 +25,9 @@ pub struct Proxy {
     // to host network.
     proxy_port: u16,
 
+    // Container name
+    container_name: String,
+
     docker_man: Sender<docker::Msg>,
 }
 
@@ -34,6 +37,7 @@ impl Proxy {
         image_name: String,
         service_port: u16,
         proxy_port: u16,
+        container_name: String,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
         Self {
@@ -41,6 +45,7 @@ impl Proxy {
             image_name,
             service_port,
             proxy_port,
+            container_name,
             docker_man,
         }
     }
@@ -61,6 +66,7 @@ impl Proxy {
             image_name: self.image_name.clone(),
             service_port: self.service_port,
             port: self.proxy_port,
+            container_name: self.container_name.clone(),
         };
 
         let response = tokio::sync::oneshot::channel();

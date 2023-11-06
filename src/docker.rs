@@ -2,7 +2,10 @@ use std::{collections::HashMap, net::Ipv4Addr};
 
 use anyhow::Context;
 use bollard::{
-    container::{self, CreateContainerOptions, StartContainerOptions, StopContainerOptions},
+    container::{
+        self, CreateContainerOptions, ListContainersOptions, StartContainerOptions,
+        StopContainerOptions,
+    },
     errors::Error,
     service::{HostConfig, PortBinding},
     Docker,
@@ -13,6 +16,8 @@ use tokio::sync::{
     oneshot,
 };
 
+const CONTAINER_NAME_PREFIX: &str = "connman-";
+
 pub enum Msg {
     Create(CreateOption, oneshot::Sender<Result<Id, Error>>),
     Start(Id),
@@ -20,7 +25,10 @@ pub enum Msg {
 }
 
 pub struct CreateOption {
-    // Container Image to start.
+    // Name of the container
+    pub container_name: String,
+
+    // Container Image to start
     pub image_name: String,
 
     // Port Exposed by the container
@@ -65,7 +73,19 @@ impl DockerMan {
         while let Some(msg) = self.conn.1.recv().await {
             match msg {
                 Msg::Create(option, response) => {
-                    let result = self.create_container(option).await;
+                    let result = if let Some(id) = self.check_container(&option).await {
+                        info!(
+                            "Not creating container<{}> as it already exists",
+                            option.container_name
+                        );
+
+                        // Set the running status of container as false.
+                        self.status.insert(id.clone(), false);
+
+                        Ok(id)
+                    } else {
+                        self.create_container(option).await
+                    };
                     let _ = response.send(result);
                 }
                 Msg::Start(id) => {
@@ -139,11 +159,14 @@ impl DockerMan {
             ..Default::default()
         };
 
-        // TODO: Assign random name for created container.
+        let container_options = CreateContainerOptions {
+            name: format!("{}{}", CONTAINER_NAME_PREFIX, options.container_name),
+            platform: None,
+        };
 
         let response = self
             .docker
-            .create_container(None::<CreateContainerOptions<String>>, config)
+            .create_container(Some(container_options), config)
             .await?;
 
         info!(
@@ -152,9 +175,41 @@ impl DockerMan {
         );
 
         let id = Id(response.id);
+
         // Set the running status of container as false.
         self.status.insert(id.clone(), false);
 
         Ok(id)
+    }
+
+    async fn check_container(&mut self, options: &CreateOption) -> Option<Id> {
+        let l_options = ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        };
+
+        let response = self.docker.list_containers(Some(l_options)).await;
+        match response {
+            Ok(summary) => {
+                for s in summary {
+                    let id = s.id;
+                    if s.image
+                        .and_then(|image| Some(image == options.image_name))
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    if let Some(true) = s.names.and_then(|names| {
+                        Some(names.iter().any(|n| n.contains(&options.container_name)))
+                    }) {
+                        return id.map(|x| Id(x));
+                    }
+                }
+            }
+            Err(err) => {
+                error!("Unable to check container: {}", err);
+            }
+        }
+        None
     }
 }

@@ -18,11 +18,14 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting connman Server");
 
     let docker_man = docker::DockerMan::new()?;
+
+    let container_name = String::from("clatter-calculate");
     let proxy = proxy::Proxy::new(
         LISTEN_PORT,
         String::from(IMAGE_NAME),
         SERVICE_PORT,
         PROXY_PORT,
+        container_name,
         docker_man.sender(),
     );
 
