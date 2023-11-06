@@ -8,7 +8,7 @@ use tokio::{
     time::{self, sleep, Instant},
 };
 
-use crate::docker::{self, Id};
+use crate::docker::{self, ContainerId};
 
 const MAX_TRIES: usize = 100;
 
@@ -179,7 +179,7 @@ impl Tick {
 
 struct Timer {
     docker_man: Sender<docker::Msg>,
-    container_id: Id,
+    container_id: ContainerId,
 
     // Duration between every tick.
     delay: Duration,
@@ -191,7 +191,7 @@ impl Timer {
         docker_man: Sender<docker::Msg>,
         delay: Duration,
         max_tick: usize,
-        container_id: Id,
+        container_id: ContainerId,
     ) -> Self {
         let tick = Tick::new(max_tick);
         Self {

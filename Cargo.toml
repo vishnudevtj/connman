@@ -9,5 +9,6 @@ edition = "2021"
 anyhow = "1.0.75"
 bollard = "0.15.0"
 env_logger = "0.10.0"
+futures-util = "0.3.29"
 log = "0.4.20"
 tokio = { version = "1", features = ["full"] }

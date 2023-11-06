@@ -173,6 +173,7 @@ dependencies = [
  "anyhow",
  "bollard",
  "env_logger",
+ "futures-util",
  "log",
  "tokio",
 ]

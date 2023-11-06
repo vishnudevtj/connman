@@ -1,5 +1,5 @@
 use env_logger::Builder;
-use log::{info, LevelFilter};
+use log::{error, info, LevelFilter};
 
 mod docker;
 mod proxy;
@@ -29,8 +29,33 @@ async fn main() -> anyhow::Result<()> {
         docker_man.sender(),
     );
 
-    tokio::spawn(docker_man.run());
-    proxy.run().await;
+    let sender = docker_man.sender();
+    let fut = async move {
+        let option = docker::ImageOption {
+            always_pull: true,
+            name: String::from(IMAGE_NAME),
+            tag: String::from("latest"),
+            credentials: None,
+        };
 
+        let response = tokio::sync::oneshot::channel();
+        let _ = sender
+            .send(docker::Msg::Register(option.clone(), response.0))
+            .await;
+        if let Ok(id) = response
+            .1
+            .await
+            .unwrap()
+            .map_err(|err| error!("Unable to pull Image<{}> : {}", option.name, err))
+        {
+            info!("Pulled Container Image : {} : {:?}", option.name, id)
+        }
+
+        proxy.run().await;
+    };
+
+    tokio::spawn(fut);
+
+    docker_man.run().await;
     Ok(())
 }

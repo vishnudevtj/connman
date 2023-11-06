@@ -1,12 +1,13 @@
-use std::{collections::HashMap, net::Ipv4Addr};
+use std::{collections::HashMap, fmt, net::Ipv4Addr};
 
 use anyhow::Context;
 use bollard::{
+    auth::DockerCredentials,
     container::{
         self, CreateContainerOptions, ListContainersOptions, StartContainerOptions,
         StopContainerOptions,
     },
-    errors::Error,
+    image::{CreateImageOptions, ListImagesOptions},
     service::{HostConfig, PortBinding},
     Docker,
 };
@@ -19,11 +20,28 @@ use tokio::sync::{
 const CONTAINER_NAME_PREFIX: &str = "connman-";
 
 pub enum Msg {
-    Create(CreateOption, oneshot::Sender<Result<Id, Error>>),
-    Start(Id),
-    Stop(Id),
+    Register(ImageOption, oneshot::Sender<Result<ImageId, Error>>),
+    Create(CreateOption, oneshot::Sender<Result<ContainerId, Error>>),
+    Start(ContainerId),
+    Stop(ContainerId),
 }
 
+#[derive(Clone)]
+pub struct ImageOption {
+    // Pull the image even if it exists locally
+    pub always_pull: bool,
+
+    // Name of the image to pull
+    pub name: String,
+
+    // Tag of the image to pull
+    pub tag: String,
+
+    // Docker Registry Credentials
+    pub credentials: Option<DockerCredentials>,
+}
+
+#[derive(Clone)]
 pub struct CreateOption {
     // Name of the container
     pub container_name: String,
@@ -40,13 +58,25 @@ pub struct CreateOption {
 
 // Represend an Id for a docker container
 #[derive(Clone, Eq, PartialEq, Hash)]
-pub struct Id(String);
+pub struct ContainerId(String);
 
+// Represend an Id for a docker container
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ImageId(String);
+
+pub enum Error {
+    Internal(bollard::errors::Error),
+    Pull(String),
+    ImageNotFound,
+}
 pub struct DockerMan {
     docker: Docker,
 
     // Tracks the status of the container.
-    status: HashMap<Id, bool>,
+    status: HashMap<ContainerId, bool>,
+
+    // Tracks all the registers images
+    registry: HashMap<String, ImageOption>,
 
     conn: (Sender<Msg>, Receiver<Msg>),
 }
@@ -57,10 +87,12 @@ impl DockerMan {
             .context("Unable to connect to local docker socket")?;
         let status = HashMap::new();
         let conn = mpsc::channel(10);
+        let registry = HashMap::new();
 
         Ok(Self {
             docker,
             status,
+            registry,
             conn,
         })
     }
@@ -73,19 +105,27 @@ impl DockerMan {
         while let Some(msg) = self.conn.1.recv().await {
             match msg {
                 Msg::Create(option, response) => {
-                    let result = if let Some(id) = self.check_container(&option).await {
-                        info!(
-                            "Not creating container<{}> as it already exists",
-                            option.container_name
-                        );
+                    let result = async {
+                        if let Some(id) = self.check_container(&option).await? {
+                            info!(
+                                "Not creating container<{}> as it already exists",
+                                option.container_name
+                            );
 
-                        // Set the running status of container as false.
-                        self.status.insert(id.clone(), false);
+                            // Set the running status of container as false.
+                            self.status.insert(id.clone(), false);
+                            Ok(id)
+                        } else {
+                            self.create_container(option).await
+                        }
+                    }
+                    .await;
+                    let _ = response.send(result);
+                }
 
-                        Ok(id)
-                    } else {
-                        self.create_container(option).await
-                    };
+                Msg::Register(option, response) => {
+                    self.registry.insert(option.name.clone(), option.clone());
+                    let result = self.check_and_pull_image(&option).await;
                     let _ = response.send(result);
                 }
                 Msg::Start(id) => {
@@ -98,7 +138,7 @@ impl DockerMan {
         }
     }
 
-    async fn start_container(&mut self, id: Id) {
+    async fn start_container(&mut self, id: ContainerId) {
         if let Some(status) = self.status.get_mut(&id) {
             if !*status {
                 let _ = self
@@ -119,7 +159,7 @@ impl DockerMan {
         }
     }
 
-    async fn stop_container(&mut self, id: Id) {
+    async fn stop_container(&mut self, id: ContainerId) {
         if let Some(status) = self.status.get_mut(&id) {
             if *status {
                 let _ = self
@@ -140,7 +180,14 @@ impl DockerMan {
         }
     }
 
-    async fn create_container(&mut self, options: CreateOption) -> Result<Id, Error> {
+    async fn create_container(&mut self, options: CreateOption) -> Result<ContainerId, Error> {
+        let image_option = self
+            .registry
+            .get(&options.image_name)
+            .ok_or(Error::ImageNotFound)?
+            .clone();
+        self.check_and_pull_image(&image_option).await?;
+
         let service_port = format!("{}/tcp", options.service_port);
         let binding = vec![PortBinding {
             host_ip: Some(Ipv4Addr::LOCALHOST.to_string()),
@@ -171,10 +218,10 @@ impl DockerMan {
 
         info!(
             "Create Container from image : {} : {}",
-            options.image_name, response.id
+            options.container_name, response.id
         );
 
-        let id = Id(response.id);
+        let id = ContainerId(response.id);
 
         // Set the running status of container as false.
         self.status.insert(id.clone(), false);
@@ -182,34 +229,116 @@ impl DockerMan {
         Ok(id)
     }
 
-    async fn check_container(&mut self, options: &CreateOption) -> Option<Id> {
+    async fn check_container(
+        &mut self,
+        options: &CreateOption,
+    ) -> Result<Option<ContainerId>, Error> {
         let l_options = ListContainersOptions::<String> {
             all: true,
             ..Default::default()
         };
 
-        let response = self.docker.list_containers(Some(l_options)).await;
-        match response {
-            Ok(summary) => {
-                for s in summary {
-                    let id = s.id;
-                    if s.image
-                        .and_then(|image| Some(image == options.image_name))
-                        .is_none()
-                    {
-                        continue;
-                    }
-                    if let Some(true) = s.names.and_then(|names| {
-                        Some(names.iter().any(|n| n.contains(&options.container_name)))
-                    }) {
-                        return id.map(|x| Id(x));
-                    }
-                }
+        let summary = self.docker.list_containers(Some(l_options)).await?;
+        for s in summary {
+            let id = s.id;
+            if s.image
+                .and_then(|image| Some(image == options.image_name))
+                .is_none()
+            {
+                continue;
             }
-            Err(err) => {
-                error!("Unable to check container: {}", err);
+            if let Some(true) = s
+                .names
+                .and_then(|names| Some(names.iter().any(|n| n.contains(&options.container_name))))
+            {
+                return Ok(id.map(|x| ContainerId(x)));
             }
         }
-        None
+        Ok(None)
+    }
+
+    async fn check_image(&mut self, options: &ImageOption) -> Result<Option<ImageId>, Error> {
+        let c_option = ListImagesOptions::<String> {
+            all: true,
+            ..Default::default()
+        };
+
+        let summary = self.docker.list_images(Some(c_option)).await?;
+        for summary in summary {
+            let result = summary
+                .repo_tags
+                .iter()
+                .any(|name| name.contains(&options.name));
+            if result {
+                return Ok(Some(ImageId(summary.id)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn pull_image(&mut self, options: &ImageOption) -> Result<ImageId, Error> {
+        use futures_util::stream::StreamExt;
+        let c_option = CreateImageOptions {
+            from_image: options.name.clone(),
+            tag: options.tag.clone(),
+            ..Default::default()
+        };
+
+        let mut response =
+            self.docker
+                .create_image(Some(c_option), None, options.credentials.clone());
+
+        while let Some(result) = response.next().await {
+            let info = result?;
+            if let (Some(status), Some(progress)) = (info.status, info.progress) {
+                info!("Pulling image<{}> :{}\t{}", &options.name, status, progress);
+            }
+            if let (Some(error), Some(error_detail)) = (info.error, info.error_detail) {
+                error!(
+                    "Error Pulling image<{}> : {:?}",
+                    &options.name, error_detail
+                );
+                Err(Error::Pull(error))?
+            }
+        }
+
+        let id = self.check_image(options).await?;
+        id.ok_or_else(|| Error::Pull(String::from("Unable to find Image Locally")))
+    }
+
+    async fn check_and_pull_image(&mut self, option: &ImageOption) -> Result<ImageId, Error> {
+        if option.always_pull {
+            return self.pull_image(&option).await;
+        }
+
+        if let Some(id) = self.check_image(&option).await? {
+            info!("Not pulling Image <{}> as it already exists", option.name);
+            Ok(id)
+        } else {
+            self.pull_image(&option).await
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Internal(err) => {
+                write!(f, "Internal Error: {}", err)
+            }
+            Error::Pull(err) => {
+                write!(f, "Pull Error: {}", err)
+            }
+            Error::ImageNotFound => {
+                write!(f, "Image not found in the Internal Registry Map")
+            }
+        }
+    }
+}
+
+impl From<bollard::errors::Error> for Error {
+    fn from(value: bollard::errors::Error) -> Self {
+        Error::Internal(value)
     }
 }
