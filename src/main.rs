@@ -121,7 +121,7 @@ fn load_certificates_from_pem(path: &Path) -> std::io::Result<Vec<Certificate>> 
 fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
     let file = File::open(&path)?;
     let mut reader = BufReader::new(file);
-    let mut keys = rustls_pemfile::rsa_private_keys(&mut reader)?;
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
 
     match keys.len() {
         0 => Err(anyhow!("No PKCS8-encoded private key found in {:?}", path)),
