@@ -7,7 +7,7 @@ use std::{
 
 use log::{error, info};
 use tokio::{
-    io::{copy, split},
+    io::{copy, split, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     pin,
     sync::{mpsc::Sender, Mutex},
@@ -194,6 +194,10 @@ impl Proxy {
                     if let Err(e) = tokio::try_join!(download, upload) {
                         error!("Error in data transfer: {:?}", e);
                     }
+
+                    let _ = proxy_w.flush().await;
+                    let _ = upstream_w.flush().await;
+
                     break;
                 }
                 Err(_) => {
