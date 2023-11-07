@@ -16,7 +16,7 @@ mod docker;
 mod proxy;
 
 const PROXY_PORT: u16 = 4243;
-const LISTEN_PORT: u16 = 4242;
+const LISTEN_PORT: u16 = 443;
 
 #[derive(FromArgs)]
 /// Auto start docker container on TCP request.
