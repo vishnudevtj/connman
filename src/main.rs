@@ -1,6 +1,16 @@
+use std::{
+    fs::File,
+    io::{self, BufReader},
+    path::{Path, PathBuf},
+};
+
+use anyhow::anyhow;
 use argh::FromArgs;
 use env_logger::Builder;
 use log::{error, info, LevelFilter};
+use rustls_pemfile::{certs, rsa_private_keys};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 mod docker;
 mod proxy;
@@ -28,6 +38,14 @@ struct ConnMan {
     #[argh(option, short = 'p')]
     service_port: u16,
 
+    /// cert file
+    #[argh(option, short = 'c')]
+    cert: PathBuf,
+
+    /// key file
+    #[argh(option, short = 'k')]
+    key: PathBuf,
+
     /// always pull image
     #[argh(option, short = 'b')]
     pull: Option<bool>,
@@ -40,6 +58,9 @@ async fn main() -> anyhow::Result<()> {
     builder.init();
 
     let connman: ConnMan = argh::from_env();
+
+    let cert = load_certificates_from_pem(&connman.cert)?;
+    let key = load_private_key_from_file(&connman.key)?;
 
     info!("Starting connman Server 0.1");
 
@@ -54,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
         PROXY_PORT,
         connman.docker_host,
         container_name,
+        cert,
+        key,
         docker_man.sender(),
     );
 
@@ -86,4 +109,26 @@ async fn main() -> anyhow::Result<()> {
 
     docker_man.run().await;
     Ok(())
+}
+
+fn load_certificates_from_pem(path: &Path) -> std::io::Result<Vec<Certificate>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)?;
+    Ok(certs.into_iter().map(Certificate).collect())
+}
+
+fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
+    let file = File::open(&path)?;
+    let mut reader = BufReader::new(file);
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
+
+    match keys.len() {
+        0 => Err(anyhow!("No PKCS8-encoded private key found in {:?}", path)),
+        1 => Ok(PrivateKey(keys.remove(0))),
+        _ => Err(anyhow!(
+            "More than one PKCS8-encoded private key found in {:?}",
+            path
+        )),
+    }
 }

@@ -7,11 +7,16 @@ use std::{
 
 use log::{error, info};
 use tokio::{
-    io::copy,
+    io::{copy, split},
     net::{TcpListener, TcpStream},
     pin,
     sync::{mpsc::Sender, Mutex},
     time::{self, interval, sleep, Instant},
+};
+use tokio_rustls::{
+    rustls::{Certificate, PrivateKey, ServerConfig},
+    server::TlsStream,
+    TlsAcceptor,
 };
 
 use crate::docker::{self, ContainerId};
@@ -36,6 +41,12 @@ pub struct Proxy {
     // Container name
     container_name: String,
 
+    // Containers Certificate
+    cert: Vec<Certificate>,
+
+    // Private Key for the certificate
+    key: PrivateKey,
+
     docker_man: Sender<docker::Msg>,
 }
 
@@ -47,6 +58,8 @@ impl Proxy {
         proxy_port: u16,
         proxy_host: String,
         container_name: String,
+        cert: Vec<Certificate>,
+        key: PrivateKey,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
         Self {
@@ -56,6 +69,8 @@ impl Proxy {
             proxy_port,
             proxy_host,
             container_name,
+            cert,
+            key,
             docker_man,
         }
     }
@@ -71,6 +86,15 @@ impl Proxy {
             "Listening on socker for image {} :  {socket_addr}",
             self.image_name
         );
+
+        let server_config = ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(self.cert.clone(), self.key.clone())
+            .map_err(|err| error!("Unable to create server_config : {err}"))
+            .unwrap();
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let option = docker::CreateOption {
             image_name: self.image_name.clone(),
@@ -96,18 +120,27 @@ impl Proxy {
 
                 while let Ok((stream, socket)) = listener.accept().await {
                     info!("Got Connection from : {socket}");
-                    let _ = self
-                        .docker_man
-                        .send(docker::Msg::Start(id.clone()))
-                        .await
-                        .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
-                    tokio::spawn(Proxy::handle_connection(
-                        stream,
-                        tick.clone(),
-                        self.proxy_host.clone(),
-                        self.proxy_port,
-                        socket,
-                    ));
+                    let acceptor = acceptor.clone();
+                    let stream = acceptor.accept(stream).await;
+                    match stream {
+                        Ok(stream) => {
+                            let _ = self
+                                .docker_man
+                                .send(docker::Msg::Start(id.clone()))
+                                .await
+                                .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
+                            tokio::spawn(Proxy::handle_connection(
+                                stream,
+                                tick.clone(),
+                                self.proxy_host.clone(),
+                                self.proxy_port,
+                                socket,
+                            ));
+                        }
+                        Err(err) => {
+                            error!("Unable to accept TLS Stream : {err}");
+                        }
+                    }
                 }
             }
             Ok(Err(err)) => {
@@ -120,7 +153,7 @@ impl Proxy {
     }
 
     async fn handle_connection(
-        mut upstream: TcpStream,
+        mut upstream: TlsStream<TcpStream>,
         tick: Tick,
         proxy_host: String,
         proxy_port: u16,
@@ -144,8 +177,8 @@ impl Proxy {
 
                     tick.reset().await;
 
-                    let (mut upstream_r, mut upstream_w) = upstream.split();
-                    let (mut proxy_r, mut proxy_w) = proxy_stream.split();
+                    let (mut upstream_r, mut upstream_w) = split(upstream);
+                    let (mut proxy_r, mut proxy_w) = split(proxy_stream);
 
                     // let mut proxy_r = tokio_io_timeout::TimeoutReader::new(proxy_r);
                     // proxy_r.set_timeout(Some(Duration::from_secs(10)));
