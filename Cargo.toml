@@ -7,8 +7,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+argh = "0.1.12"
 bollard = "0.15.0"
 env_logger = "0.10.0"
 futures-util = "0.3.29"
 log = "0.4.20"
 tokio = { version = "1", features = ["full"] }
+tokio-dns = "0.0.0"
+tokio-io-timeout = "1.2.0"

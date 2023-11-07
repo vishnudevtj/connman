@@ -1,11 +1,17 @@
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use log::{error, info};
 use tokio::{
     io::copy,
     net::{TcpListener, TcpStream},
+    pin,
     sync::{mpsc::Sender, Mutex},
-    time::{self, sleep, Instant},
+    time::{self, interval, sleep, Instant},
 };
 
 use crate::docker::{self, ContainerId};
@@ -22,8 +28,10 @@ pub struct Proxy {
     service_port: u16,
 
     // Port on which the container maps the service port
-    // to host network.
     proxy_port: u16,
+
+    // Address on which the container starts
+    proxy_host: String,
 
     // Container name
     container_name: String,
@@ -37,6 +45,7 @@ impl Proxy {
         image_name: String,
         service_port: u16,
         proxy_port: u16,
+        proxy_host: String,
         container_name: String,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
@@ -45,6 +54,7 @@ impl Proxy {
             image_name,
             service_port,
             proxy_port,
+            proxy_host,
             container_name,
             docker_man,
         }
@@ -94,7 +104,9 @@ impl Proxy {
                     tokio::spawn(Proxy::handle_connection(
                         stream,
                         tick.clone(),
+                        self.proxy_host.clone(),
                         self.proxy_port,
+                        socket,
                     ));
                 }
             }
@@ -107,7 +119,13 @@ impl Proxy {
         }
     }
 
-    async fn handle_connection(mut upstream: TcpStream, tick: Tick, proxy_port: u16) {
+    async fn handle_connection(
+        mut upstream: TcpStream,
+        tick: Tick,
+        proxy_host: String,
+        proxy_port: u16,
+        socket: SocketAddr,
+    ) {
         let mut no_of_try = MAX_TRIES;
         let instant = Instant::now();
         loop {
@@ -116,7 +134,7 @@ impl Proxy {
             }
             no_of_try -= 1;
 
-            match TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port)).await {
+            match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
                 Ok(mut proxy_stream) => {
                     info!(
                         "Proxied Connection after try: {} : {:?}",
@@ -128,6 +146,14 @@ impl Proxy {
 
                     let (mut upstream_r, mut upstream_w) = upstream.split();
                     let (mut proxy_r, mut proxy_w) = proxy_stream.split();
+
+                    // let mut proxy_r = tokio_io_timeout::TimeoutReader::new(proxy_r);
+                    // proxy_r.set_timeout(Some(Duration::from_secs(10)));
+                    // let mut proxy_r = Box::pin(proxy_r);
+
+                    // let mut proxy_w = tokio_io_timeout::TimeoutWriter::new(proxy_w);
+                    // proxy_w.set_timeout(Some(Duration::from_secs(10)));
+                    // let mut proxy_w = Box::pin(proxy_w);
 
                     let download = copy(&mut upstream_r, &mut proxy_w);
                     let upload = copy(&mut proxy_r, &mut upstream_w);
@@ -143,6 +169,10 @@ impl Proxy {
                 }
             }
         }
+        info!(
+            "Connection closed for: {socket} elapsed time {:?}",
+            instant.elapsed()
+        );
     }
 }
 

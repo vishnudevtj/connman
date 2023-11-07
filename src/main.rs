@@ -1,13 +1,37 @@
+use argh::FromArgs;
 use env_logger::Builder;
 use log::{error, info, LevelFilter};
 
 mod docker;
 mod proxy;
 
-const IMAGE_NAME: &str = "aswinmguptha/flashy_machine";
-const SERVICE_PORT: u16 = 5000;
 const PROXY_PORT: u16 = 4243;
 const LISTEN_PORT: u16 = 4242;
+
+#[derive(FromArgs)]
+/// Auto start docker container on TCP request.
+struct ConnMan {
+    /// address of docker HTTP API server   
+    #[argh(option, short = 'd')]
+    docker_host: String,
+
+    /// port on which docker HTTP API server
+    /// listens
+    #[argh(option, short = 'q')]
+    docker_port: u16,
+
+    /// name of the Docker image
+    #[argh(option, short = 'i')]
+    image: String,
+
+    /// port exposed by the image
+    #[argh(option, short = 'p')]
+    service_port: u16,
+
+    /// always pull image
+    #[argh(option, short = 'b')]
+    pull: Option<bool>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,16 +39,20 @@ async fn main() -> anyhow::Result<()> {
     builder.filter_level(LevelFilter::Info);
     builder.init();
 
-    info!("Starting connman Server");
+    let connman: ConnMan = argh::from_env();
 
-    let docker_man = docker::DockerMan::new()?;
+    info!("Starting connman Server 0.1");
+
+    let docker_socket_addr = format!("{}:{}", &connman.docker_host, connman.docker_port);
+    let docker_man = docker::DockerMan::new(docker_socket_addr)?;
 
     let container_name = String::from("clatter-calculate");
     let proxy = proxy::Proxy::new(
         LISTEN_PORT,
-        String::from(IMAGE_NAME),
-        SERVICE_PORT,
+        connman.image.clone(),
+        connman.service_port,
         PROXY_PORT,
+        connman.docker_host,
         container_name,
         docker_man.sender(),
     );
@@ -32,8 +60,8 @@ async fn main() -> anyhow::Result<()> {
     let sender = docker_man.sender();
     let fut = async move {
         let option = docker::ImageOption {
-            always_pull: true,
-            name: String::from(IMAGE_NAME),
+            always_pull: connman.pull.unwrap_or(false),
+            name: connman.image.clone(),
             tag: String::from("latest"),
             credentials: None,
         };

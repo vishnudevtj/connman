@@ -9,7 +9,7 @@ use bollard::{
     },
     image::{CreateImageOptions, ListImagesOptions},
     service::{HostConfig, PortBinding},
-    Docker,
+    Docker, API_DEFAULT_VERSION,
 };
 use log::{error, info};
 use tokio::sync::{
@@ -82,9 +82,10 @@ pub struct DockerMan {
 }
 
 impl DockerMan {
-    pub fn new() -> anyhow::Result<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .context("Unable to connect to local docker socket")?;
+    pub fn new(addr: String) -> anyhow::Result<Self> {
+        let docker = Docker::connect_with_http(&addr, 30, API_DEFAULT_VERSION)?;
+        // let docker = Docker::connect_with_local_defaults()
+        //     .context("Unable to connect to local docker socket")?;
         let status = HashMap::new();
         let conn = mpsc::channel(10);
         let registry = HashMap::new();
@@ -148,6 +149,7 @@ impl DockerMan {
                     .map_err(|err| error!("Unable to start container: {} : {}", id.0, err));
 
                 info!("Starting container: {}", id.0);
+
                 // Update the status of container as running.
                 *status = true;
             }
@@ -169,6 +171,7 @@ impl DockerMan {
                     .map_err(|err| error!("Unable to stop container: {} : {}", id.0, err));
 
                 info!("Stoping container: {}", id.0);
+
                 // Update the status of container as stopped.
                 *status = false;
             }
@@ -190,7 +193,7 @@ impl DockerMan {
 
         let service_port = format!("{}/tcp", options.service_port);
         let binding = vec![PortBinding {
-            host_ip: Some(Ipv4Addr::LOCALHOST.to_string()),
+            host_ip: Some(String::from("0.0.0.0")),
             host_port: Some(options.port.to_string()),
         }];
 
