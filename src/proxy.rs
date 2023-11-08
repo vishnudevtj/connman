@@ -1,6 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
-    pin::Pin,
+    net::{SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -10,11 +9,10 @@ use std::{
 
 use log::{error, info, warn};
 use tokio::{
-    io::{copy, copy_bidirectional, split, AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    pin,
-    sync::{mpsc::Sender, Mutex},
-    time::{self, interval, sleep, Instant},
+    sync::{mpsc::Sender},
+    time::{sleep, Instant},
 };
 use tokio_rustls::{
     rustls::{Certificate, PrivateKey, ServerConfig},

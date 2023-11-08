@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, BufReader},
+    io::{BufReader},
     path::{Path, PathBuf},
 };
 
@@ -8,8 +8,8 @@ use anyhow::anyhow;
 use argh::FromArgs;
 use env_logger::Builder;
 use log::{error, info, LevelFilter};
-use rustls_pemfile::{certs, rsa_private_keys};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 mod docker;
@@ -131,7 +131,7 @@ fn load_certificates_from_pem(path: &Path) -> std::io::Result<Vec<Certificate>> 
 }
 
 fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
-    let file = File::open(&path)?;
+    let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
 

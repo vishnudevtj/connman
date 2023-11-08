@@ -1,6 +1,6 @@
-use std::{collections::HashMap, fmt, net::Ipv4Addr};
+use std::{collections::HashMap, fmt};
 
-use anyhow::Context;
+
 use bollard::{
     auth::DockerCredentials,
     container::{
@@ -244,17 +244,15 @@ impl DockerMan {
         let summary = self.docker.list_containers(Some(l_options)).await?;
         for s in summary {
             let id = s.id;
-            if s.image
-                .and_then(|image| Some(image == options.image_name))
+            if s.image.map(|image| image == options.image_name)
                 .is_none()
             {
                 continue;
             }
             if let Some(true) = s
-                .names
-                .and_then(|names| Some(names.iter().any(|n| n.contains(&options.container_name))))
+                .names.map(|names| names.iter().any(|n| n.contains(&options.container_name)))
             {
-                return Ok(id.map(|x| ContainerId(x)));
+                return Ok(id.map(ContainerId));
             }
         }
         Ok(None)
@@ -312,14 +310,14 @@ impl DockerMan {
 
     async fn check_and_pull_image(&mut self, option: &ImageOption) -> Result<ImageId, Error> {
         if option.always_pull {
-            return self.pull_image(&option).await;
+            return self.pull_image(option).await;
         }
 
-        if let Some(id) = self.check_image(&option).await? {
+        if let Some(id) = self.check_image(option).await? {
             info!("Not pulling Image <{}> as it already exists", option.name);
             Ok(id)
         } else {
-            self.pull_image(&option).await
+            self.pull_image(option).await
         }
     }
 }
