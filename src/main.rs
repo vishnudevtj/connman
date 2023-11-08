@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader},
+    io::BufReader,
     path::{Path, PathBuf},
 };
 
@@ -8,7 +8,6 @@ use anyhow::anyhow;
 use argh::FromArgs;
 use env_logger::Builder;
 use log::{error, info, LevelFilter};
-
 
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
@@ -74,47 +73,50 @@ async fn main() -> anyhow::Result<()> {
         key = Some(load_private_key_from_file(&k)?);
     }
 
-    info!("Starting connman Server 0.1");
+    info!("Starting connman Server 0.2");
 
     let docker_socket_addr = format!("{}:{}", &connman.docker_host, connman.docker_port);
     let docker_man = docker::DockerMan::new(docker_socket_addr)?;
 
-    let container_name = String::from("clatter-calculate");
+    let image_option = docker::ImageOption {
+        always_pull: connman.pull.unwrap_or(false),
+        name: connman.image.clone(),
+        tag: String::from("latest"),
+        credentials: None,
+    };
+
     let proxy = proxy::Proxy::new(
         listen_port,
         connman.image.clone(),
         connman.service_port,
         PROXY_PORT,
         connman.docker_host,
-        container_name,
         cert,
         key,
         docker_man.sender(),
     );
 
     let sender = docker_man.sender();
-    let fut = async move {
-        let option = docker::ImageOption {
-            always_pull: connman.pull.unwrap_or(false),
-            name: connman.image.clone(),
-            tag: String::from("latest"),
-            credentials: None,
-        };
 
+    let fut = async move {
         let response = tokio::sync::oneshot::channel();
         let _ = sender
-            .send(docker::Msg::Register(option.clone(), response.0))
-            .await;
-        if let Ok(id) = response
-            .1
+            .send(docker::Msg::Register(image_option.clone(), response.0))
             .await
-            .unwrap()
-            .map_err(|err| error!("Unable to pull Image<{}> : {}", option.name, err))
-        {
-            info!("Pulled Container Image : {} : {:?}", option.name, id)
-        }
+            .map_err(|err| error!("Unable to send Msg::Register to docker_man: {}", err));
 
-        proxy.run().await;
+        match response.1.await {
+            Ok(Ok(id)) => {
+                info!("Pulled Container Image : {} : {:?}", image_option.name, id);
+                proxy.run().await;
+            }
+            Ok(Err(err)) => {
+                error!("Unable to pull image: {err}");
+            }
+            Err(err) => {
+                error!("Error while receiving reponse from docker_man: {err}")
+            }
+        }
     };
 
     tokio::spawn(fut);

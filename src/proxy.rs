@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -7,11 +7,12 @@ use std::{
     time::Duration,
 };
 
+use highway::{HighwayHash, HighwayHasher, Key};
 use log::{error, info, warn};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc::Sender},
+    sync::mpsc::Sender,
     time::{sleep, Instant},
 };
 use tokio_rustls::{
@@ -63,11 +64,19 @@ impl Proxy {
         service_port: u16,
         proxy_port: u16,
         proxy_host: String,
-        container_name: String,
         cert: Option<Vec<Certificate>>,
         key: Option<PrivateKey>,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
+        let hash_key = Key([0xdeadbeef, 0xcafebabe, 0x4242, 0x6969]);
+        let mut hasher = HighwayHasher::new(hash_key);
+        hasher.append(&listen_port.to_le_bytes());
+        hasher.append(&image_name.as_bytes());
+        hasher.append(&service_port.to_le_bytes());
+        hasher.append(&proxy_host.as_bytes());
+        hasher.append(&proxy_port.to_le_bytes());
+        let container_name = hasher.finalize64().to_string();
+
         Self {
             listen_port,
             image_name,
@@ -82,6 +91,11 @@ impl Proxy {
     }
 
     pub async fn run(&self) {
+        info!("Starting Proxy for: \t{}", self.image_name);
+        info!("\tContainer Name: \t{}", self.container_name);
+        info!("\tListen Port:\t{}", self.listen_port);
+        info!("\tProxying to\t{}:{}", self.proxy_host, self.proxy_port);
+
         let socket_addr = format!("0.0.0.0:{}", self.listen_port);
         let listener = TcpListener::bind(&socket_addr)
             .await
@@ -285,7 +299,7 @@ impl ConnTrack {
 
         loop {
             let no_conn = self.no_conn.load(Ordering::SeqCst);
-            info!("Total No of connection active : {}", no_conn);
+            // info!("Total No of conne`cargo clippy --fix --bin "connman"ction active : {}", no_conn);
             if no_conn > 0 {
                 last_activity = Instant::now();
             } else {
