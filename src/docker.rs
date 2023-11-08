@@ -137,8 +137,8 @@ impl DockerMan {
                 }
 
                 Msg::Register(option, response) => {
-                    let container_id = ImageId::from(&option);
-                    self.registry.insert(container_id, option.clone());
+                    let image_id = ImageId::from(&option);
+                    self.registry.insert(image_id, option.clone());
 
                     let docker = self.docker.clone();
                     let fut = async move {
@@ -170,7 +170,10 @@ impl DockerMan {
                 }
 
                 Msg::UpdateStatus(id, status) => {
-                    self.status.entry(id).and_modify(|s| *s = status);
+                    self.status
+                        .entry(id)
+                        .and_modify(|s| *s = status)
+                        .or_insert(status);
                 }
             }
         }
@@ -334,7 +337,7 @@ impl DockerMan {
                 .iter()
                 .any(|name| name.contains(&options.name));
             if result {
-                return Ok(Some(ImageId(summary.id)));
+                return Ok(Some(ImageId::from(options)));
             }
         }
 
