@@ -1,13 +1,16 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::{
-    io::{copy, split, AsyncWriteExt},
+    io::{copy, copy_bidirectional, split, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     pin,
     sync::{mpsc::Sender, Mutex},
@@ -114,9 +117,11 @@ impl Proxy {
         match response {
             Ok(Ok(id)) => {
                 let delay = Duration::from_secs(10);
-                let timer = Timer::new(self.docker_man.clone(), delay, 6, id.clone());
-                let tick = timer.tick();
-                tokio::spawn(timer.run());
+
+                let conn_tracker =
+                    ConnTrack::new(Duration::from_secs(60), self.docker_man.clone(), id.clone());
+                let no_conn = conn_tracker.no_conn();
+                tokio::spawn(conn_tracker.run());
 
                 while let Ok((stream, socket)) = listener.accept().await {
                     info!("Got Connection from : {socket}");
@@ -131,7 +136,7 @@ impl Proxy {
                                 .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
                             tokio::spawn(Proxy::handle_connection(
                                 stream,
-                                tick.clone(),
+                                no_conn.clone(),
                                 self.proxy_host.clone(),
                                 self.proxy_port,
                                 socket,
@@ -154,7 +159,7 @@ impl Proxy {
 
     async fn handle_connection(
         mut upstream: TlsStream<TcpStream>,
-        tick: Tick,
+        no_conn: Arc<AtomicU64>,
         proxy_host: String,
         proxy_port: u16,
         socket: SocketAddr,
@@ -175,29 +180,31 @@ impl Proxy {
                         instant.elapsed()
                     );
 
-                    tick.reset().await;
+                    // Increment the no of connection.
+                    no_conn.fetch_add(1, Ordering::SeqCst);
 
-                    let (mut upstream_r, mut upstream_w) = split(upstream);
-                    let (mut proxy_r, mut proxy_w) = split(proxy_stream);
-
-                    // let mut proxy_r = tokio_io_timeout::TimeoutReader::new(proxy_r);
-                    // proxy_r.set_timeout(Some(Duration::from_secs(10)));
-                    // let mut proxy_r = Box::pin(proxy_r);
-
-                    // let mut proxy_w = tokio_io_timeout::TimeoutWriter::new(proxy_w);
-                    // proxy_w.set_timeout(Some(Duration::from_secs(10)));
-                    // let mut proxy_w = Box::pin(proxy_w);
-
-                    let download = copy(&mut upstream_r, &mut proxy_w);
-                    let upload = copy(&mut proxy_r, &mut upstream_w);
-
-                    if let Err(e) = tokio::try_join!(download, upload) {
-                        error!("Error in data transfer: {:?}", e);
+                    match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
+                        Ok((to_egress, to_ingress)) => {
+                            info!(
+                                "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
+                            );
+                        }
+                        Err(err) => {
+                            error!("Error while proxying: {socket} : {err}");
+                        }
                     }
 
-                    let _ = proxy_w.flush().await;
-                    let _ = upstream_w.flush().await;
+                    let _ = upstream.flush().await.map_err(|err| {
+                        warn!("Unable to flush upstream of socket : {socket} : {err}")
+                    });
 
+                    let _ = proxy_stream
+                        .flush()
+                        .await
+                        .map_err(|err| warn!("Unable to flush proxy of socket: {socket} {err}"));
+
+                    // Decrement the no of connections.
+                    no_conn.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
                 Err(_) => {
@@ -213,79 +220,65 @@ impl Proxy {
     }
 }
 
-#[derive(Clone)]
-struct Tick {
-    // Max value to tick from
-    max: usize,
-    current_value: Arc<Mutex<usize>>,
-}
+// This handles the trackking of connection
+// and stops the container after a period of idle
+// time
+struct ConnTrack {
+    // determines how much time the runner should sleep
+    // before checking for the number of active connection.
+    interval: Duration,
 
-impl Tick {
-    fn new(max: usize) -> Self {
-        let lock = Arc::new(Mutex::new(max));
-        Self {
-            max,
-            current_value: lock,
-        }
-    }
+    // tracks the number of active connection.
+    no_conn: Arc<AtomicU64>,
 
-    async fn reset(&self) {
-        let mut value = self.current_value.lock().await;
-        *value = self.max;
-    }
+    // determines the idle time after which the connection
+    // closed
+    timeout: Duration,
 
-    async fn tick(&self) -> usize {
-        let mut lock = self.current_value.lock().await;
-        let current_value = *lock;
-        if current_value != 0 {
-            *lock -= 1
-        }
-        current_value
-    }
-}
-
-struct Timer {
+    // channel to dockerman
     docker_man: Sender<docker::Msg>,
-    container_id: ContainerId,
 
-    // Duration between every tick.
-    delay: Duration,
-    timer: Tick,
+    // if of the container that is being tracked
+    container_id: ContainerId,
 }
 
-impl Timer {
-    fn new(
-        docker_man: Sender<docker::Msg>,
-        delay: Duration,
-        max_tick: usize,
-        container_id: ContainerId,
-    ) -> Self {
-        let tick = Tick::new(max_tick);
+impl ConnTrack {
+    fn new(timeout: Duration, docker_man: Sender<docker::Msg>, container_id: ContainerId) -> Self {
+        let no_conn = Arc::new(AtomicU64::default());
+        let interval = Duration::from_secs(5);
         Self {
+            no_conn,
+            interval,
+            timeout,
             docker_man,
-            delay,
-            timer: tick,
             container_id,
         }
     }
 
-    fn tick(&self) -> Tick {
-        self.timer.clone()
+    fn no_conn(&self) -> Arc<AtomicU64> {
+        self.no_conn.clone()
     }
 
     async fn run(self) {
-        let mut interval = time::interval(self.delay);
-        loop {
-            interval.tick().await;
+        let mut last_activity = Instant::now();
 
-            let tick = self.timer.tick().await;
-            if tick == 0 {
-                let _ = self
-                    .docker_man
-                    .send(docker::Msg::Stop(self.container_id.clone()))
-                    .await
-                    .map_err(|err| error!("Unable to send message to DockerMan: {}", err));
+        loop {
+            let no_conn = self.no_conn.load(Ordering::SeqCst);
+            info!("Total No of connection active : {}", no_conn);
+            if no_conn > 0 {
+                last_activity = Instant::now();
+            } else {
+                let idle = last_activity.elapsed();
+                if idle >= self.timeout {
+                    let _ = self
+                        .docker_man
+                        .send(docker::Msg::Stop(self.container_id.clone()))
+                        .await
+                        .map_err(|err| error!("Unable to send message to DockerMan: {}", err));
+                }
             }
+
+            sleep(self.interval).await;
         }
     }
 }
