@@ -102,11 +102,6 @@ impl Proxy {
             .map_err(|err| error!("Unable to Listen on addr: {} : {}", socket_addr, err))
             .unwrap();
 
-        info!(
-            "Listening on socker for image {} :  {socket_addr}",
-            self.image_name
-        );
-
         let mut acceptor = None;
         if let (Some(cert), Some(key)) = (self.cert.clone(), self.key.clone()) {
             let server_config = ServerConfig::builder()
@@ -299,7 +294,11 @@ impl ConnTrack {
 
         loop {
             let no_conn = self.no_conn.load(Ordering::SeqCst);
-            // info!("Total No of conne`cargo clippy --fix --bin "connman"ction active : {}", no_conn);
+
+            if no_conn != 0 {
+                info!("Total No of connection active : {}", no_conn);
+            }
+
             if no_conn > 0 {
                 last_activity = Instant::now();
             } else {
