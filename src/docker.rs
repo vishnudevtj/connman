@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fmt};
 
-
 use bollard::{
     auth::DockerCredentials,
     container::{
@@ -11,11 +10,15 @@ use bollard::{
     service::{HostConfig, PortBinding},
     Docker, API_DEFAULT_VERSION,
 };
+use highway::HighwayHash;
+use highway::{HighwayHasher, Key};
 use log::{error, info};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
+
+use crate::HASH_KEY;
 
 const CONTAINER_NAME_PREFIX: &str = "connman-";
 
@@ -24,11 +27,13 @@ pub enum Msg {
     Create(CreateOption, oneshot::Sender<Result<ContainerId, Error>>),
     Start(ContainerId),
     Stop(ContainerId),
+    UpdateStatus(ContainerId, bool),
 }
 
 #[derive(Clone)]
 pub struct ImageOption {
-    // Pull the image even if it exists locally
+    // Pull the image even if it exists locally when the
+    // image is registered
     pub always_pull: bool,
 
     // Name of the image to pull
@@ -37,20 +42,20 @@ pub struct ImageOption {
     // Tag of the image to pull
     pub tag: String,
 
+    // Port Exposed by the container
+    pub service_port: u16,
+
     // Docker Registry Credentials
     pub credentials: Option<DockerCredentials>,
 }
 
 #[derive(Clone)]
 pub struct CreateOption {
+    // Determines from which image the container is created
+    pub image_id: ImageId,
+
     // Name of the container
     pub container_name: String,
-
-    // Container Image to start
-    pub image_name: String,
-
-    // Port Exposed by the container
-    pub service_port: u16,
 
     // Port binding on host
     pub port: u16,
@@ -69,14 +74,16 @@ pub enum Error {
     Pull(String),
     ImageNotFound,
 }
+
 pub struct DockerMan {
     docker: Docker,
 
-    // Tracks the status of the container.
+    // Tracks the running status of the container.
     status: HashMap<ContainerId, bool>,
 
-    // Tracks all the registers images
-    registry: HashMap<String, ImageOption>,
+    // Registry containing details of all the images
+    // in this docker host
+    registry: HashMap<ImageId, ImageOption>,
 
     conn: (Sender<Msg>, Receiver<Msg>),
 }
@@ -84,8 +91,10 @@ pub struct DockerMan {
 impl DockerMan {
     pub fn new(addr: String) -> anyhow::Result<Self> {
         let docker = Docker::connect_with_http(&addr, 30, API_DEFAULT_VERSION)?;
+
         // let docker = Docker::connect_with_local_defaults()
         //     .context("Unable to connect to local docker socket")?;
+
         let status = HashMap::new();
         let conn = mpsc::channel(10);
         let registry = HashMap::new();
@@ -106,92 +115,142 @@ impl DockerMan {
         while let Some(msg) = self.conn.1.recv().await {
             match msg {
                 Msg::Create(option, response) => {
-                    let result = async {
-                        if let Some(id) = self.check_container(&option).await? {
-                            info!(
-                                "Not creating container<{}> as it already exists",
-                                option.container_name
-                            );
+                    let sender = self.sender();
+                    let docker = self.docker.clone();
+                    if let Some(image_option) = self.registry.get(&option.image_id) {
+                        let image_option = image_option.clone();
 
-                            // Set the running status of container as false.
-                            self.status.insert(id.clone(), false);
-                            Ok(id)
-                        } else {
-                            self.create_container(option).await
-                        }
-                    }
-                    .await;
-                    let _ = response.send(result);
+                        let future = async move {
+                            let result = DockerMan::check_and_create_container(
+                                docker,
+                                option,
+                                &image_option,
+                                sender,
+                            )
+                            .await;
+                            let _ = response.send(result);
+                        };
+                        tokio::spawn(future);
+                    } else {
+                        let _ = response.send(Err(Error::ImageNotFound));
+                    };
                 }
 
                 Msg::Register(option, response) => {
-                    self.registry.insert(option.name.clone(), option.clone());
-                    let result = self.check_and_pull_image(&option).await;
-                    let _ = response.send(result);
+                    let container_id = ImageId::from(&option);
+                    self.registry.insert(container_id, option.clone());
+
+                    let docker = self.docker.clone();
+                    let fut = async move {
+                        let result = DockerMan::check_and_pull_image(&docker, &option).await;
+                        let _ = response.send(result);
+                    };
+
+                    tokio::spawn(fut);
                 }
                 Msg::Start(id) => {
-                    self.start_container(id).await;
+                    let sender = self.sender();
+                    let docker = self.docker.clone();
+                    self.status.get(&id).map(|status| {
+                        // If the container is not running
+                        if !status {
+                            tokio::spawn(DockerMan::start_container(docker, id, sender));
+                        }
+                    });
                 }
                 Msg::Stop(id) => {
-                    self.stop_container(id).await;
+                    let sender = self.sender();
+                    let docker = self.docker.clone();
+                    self.status.get(&id).map(|status| {
+                        // If the container is running
+                        if *status {
+                            tokio::spawn(DockerMan::stop_container(docker, id, sender));
+                        }
+                    });
+                }
+
+                Msg::UpdateStatus(id, status) => {
+                    self.status.entry(id).and_modify(|s| *s = status);
                 }
             }
         }
     }
 
-    async fn start_container(&mut self, id: ContainerId) {
-        if let Some(status) = self.status.get_mut(&id) {
-            if !*status {
-                let _ = self
-                    .docker
-                    .start_container(&id.0, None::<StartContainerOptions<String>>)
-                    .await
-                    .map_err(|err| error!("Unable to start container: {} : {}", id.0, err));
+    async fn start_container(docker: Docker, id: ContainerId, sender: Sender<Msg>) {
+        info!("Starting container: {}", id.0);
 
-                info!("Starting container: {}", id.0);
-
-                // Update the status of container as running.
-                *status = true;
-            }
-        } else {
-            error!(
-                "Unable to start container: {} : Id not found in Internal Map",
-                id.0
-            );
+        if let Ok(_) = docker
+            .start_container(&id.0, None::<StartContainerOptions<String>>)
+            .await
+            .map_err(|err| error!("Unable to start container: {} : {}", id.0, err))
+        {
+            // Update the status of container as running.
+            let _ = sender
+                .send(Msg::UpdateStatus(id, true))
+                .await
+                .map_err(|err| {
+                    error!(
+                        "Unable to update the status of container while starting container :{err}"
+                    )
+                });
         }
     }
 
-    async fn stop_container(&mut self, id: ContainerId) {
-        if let Some(status) = self.status.get_mut(&id) {
-            if *status {
-                let _ = self
-                    .docker
-                    .stop_container(&id.0, None::<StopContainerOptions>)
-                    .await
-                    .map_err(|err| error!("Unable to stop container: {} : {}", id.0, err));
+    async fn stop_container(docker: Docker, id: ContainerId, sender: Sender<Msg>) {
+        info!("Stoping container: {}", id.0);
 
-                info!("Stoping container: {}", id.0);
-
-                // Update the status of container as stopped.
-                *status = false;
-            }
-        } else {
-            error!(
-                "Unable to stop container: {} : Id not found in Internal Map",
-                id.0
-            );
+        if let Ok(_) = docker
+            .stop_container(&id.0, None::<StopContainerOptions>)
+            .await
+            .map_err(|err| error!("Unable to stop container: {} : {}", id.0, err))
+        {
+            // Update the status of container as stopped.
+            let _ = sender
+                .send(Msg::UpdateStatus(id, false))
+                .await
+                .map_err(|err| {
+                    error!(
+                        "Unable to update the status of container while stoping container: {err}"
+                    )
+                });
         }
     }
 
-    async fn create_container(&mut self, options: CreateOption) -> Result<ContainerId, Error> {
-        let image_option = self
-            .registry
-            .get(&options.image_name)
-            .ok_or(Error::ImageNotFound)?
-            .clone();
-        self.check_and_pull_image(&image_option).await?;
+    async fn check_and_create_container(
+        docker: Docker,
+        options: CreateOption,
+        image_option: &ImageOption,
+        sender: Sender<Msg>,
+    ) -> Result<ContainerId, Error> {
+        if let Some(id) = DockerMan::check_container(&docker, &options, image_option).await? {
+            info!(
+                "Not creating container<{}> as it already exists",
+                options.container_name
+            );
 
-        let service_port = format!("{}/tcp", options.service_port);
+            // Set the running status of container as false.
+            let _ = sender
+                .send(Msg::UpdateStatus(id.clone(), false))
+                .await
+                .map_err(|err| error!("Unable to update status while creating container: {err}"));
+            Ok(id)
+        } else {
+            DockerMan::create_container(&docker, options, image_option, sender).await
+        }
+    }
+
+    async fn create_container(
+        docker: &Docker,
+        options: CreateOption,
+        image_option: &ImageOption,
+        sender: Sender<Msg>,
+    ) -> Result<ContainerId, Error> {
+        info!("Creating Container from image: {}", &image_option.name);
+
+        // Check if the image exists, if not pull the image.
+        DockerMan::check_and_pull_image(docker, image_option).await?;
+
+        let service_port = format!("{}/tcp", image_option.service_port);
         let binding = vec![PortBinding {
             host_ip: Some(String::from("0.0.0.0")),
             host_port: Some(options.port.to_string()),
@@ -203,7 +262,7 @@ impl DockerMan {
         });
 
         let config = container::Config {
-            image: Some(options.image_name.clone()),
+            image: Some(image_option.name.clone()),
             host_config,
             exposed_ports: Some(HashMap::from([(service_port, HashMap::new())])),
             ..Default::default()
@@ -214,8 +273,7 @@ impl DockerMan {
             platform: None,
         };
 
-        let response = self
-            .docker
+        let response = docker
             .create_container(Some(container_options), config)
             .await?;
 
@@ -227,30 +285,35 @@ impl DockerMan {
         let id = ContainerId(response.id);
 
         // Set the running status of container as false.
-        self.status.insert(id.clone(), false);
+        let _ = sender
+            .send(Msg::UpdateStatus(id.clone(), false))
+            .await
+            .map_err(|err| {
+                error!("Unable to update status of container when creating container: {err}")
+            });
 
         Ok(id)
     }
 
     async fn check_container(
-        &mut self,
+        docker: &Docker,
         options: &CreateOption,
+        image_option: &ImageOption,
     ) -> Result<Option<ContainerId>, Error> {
         let l_options = ListContainersOptions::<String> {
             all: true,
             ..Default::default()
         };
 
-        let summary = self.docker.list_containers(Some(l_options)).await?;
+        let summary = docker.list_containers(Some(l_options)).await?;
         for s in summary {
             let id = s.id;
-            if s.image.map(|image| image == options.image_name)
-                .is_none()
-            {
+            if s.image.map(|image| image == image_option.name).is_none() {
                 continue;
             }
             if let Some(true) = s
-                .names.map(|names| names.iter().any(|n| n.contains(&options.container_name)))
+                .names
+                .map(|names| names.iter().any(|n| n.contains(&options.container_name)))
             {
                 return Ok(id.map(ContainerId));
             }
@@ -258,13 +321,13 @@ impl DockerMan {
         Ok(None)
     }
 
-    async fn check_image(&mut self, options: &ImageOption) -> Result<Option<ImageId>, Error> {
+    async fn check_image(docker: &Docker, options: &ImageOption) -> Result<Option<ImageId>, Error> {
         let c_option = ListImagesOptions::<String> {
             all: true,
             ..Default::default()
         };
 
-        let summary = self.docker.list_images(Some(c_option)).await?;
+        let summary = docker.list_images(Some(c_option)).await?;
         for summary in summary {
             let result = summary
                 .repo_tags
@@ -278,7 +341,7 @@ impl DockerMan {
         Ok(None)
     }
 
-    async fn pull_image(&mut self, options: &ImageOption) -> Result<ImageId, Error> {
+    async fn pull_image(docker: &Docker, options: &ImageOption) -> Result<ImageId, Error> {
         use futures_util::stream::StreamExt;
         let c_option = CreateImageOptions {
             from_image: options.name.clone(),
@@ -286,9 +349,7 @@ impl DockerMan {
             ..Default::default()
         };
 
-        let mut response =
-            self.docker
-                .create_image(Some(c_option), None, options.credentials.clone());
+        let mut response = docker.create_image(Some(c_option), None, options.credentials.clone());
 
         while let Some(result) = response.next().await {
             let info = result?;
@@ -304,20 +365,20 @@ impl DockerMan {
             }
         }
 
-        let id = self.check_image(options).await?;
+        let id = DockerMan::check_image(docker, options).await?;
         id.ok_or_else(|| Error::Pull(String::from("Unable to find Image Locally")))
     }
 
-    async fn check_and_pull_image(&mut self, option: &ImageOption) -> Result<ImageId, Error> {
+    async fn check_and_pull_image(docker: &Docker, option: &ImageOption) -> Result<ImageId, Error> {
         if option.always_pull {
-            return self.pull_image(option).await;
+            return DockerMan::pull_image(docker, option).await;
         }
 
-        if let Some(id) = self.check_image(option).await? {
+        if let Some(id) = DockerMan::check_image(docker, option).await? {
             info!("Not pulling Image <{}> as it already exists", option.name);
             Ok(id)
         } else {
-            self.pull_image(option).await
+            DockerMan::pull_image(docker, option).await
         }
     }
 }
@@ -341,5 +402,16 @@ impl fmt::Display for Error {
 impl From<bollard::errors::Error> for Error {
     fn from(value: bollard::errors::Error) -> Self {
         Error::Internal(value)
+    }
+}
+
+impl From<&ImageOption> for ImageId {
+    fn from(value: &ImageOption) -> Self {
+        let hash_key = Key(HASH_KEY);
+        let mut hasher = HighwayHasher::new(hash_key);
+        hasher.append(value.name.as_bytes());
+        hasher.append(value.tag.as_bytes());
+        hasher.append(&value.service_port.to_le_bytes());
+        ImageId(hasher.finalize64().to_string())
     }
 }

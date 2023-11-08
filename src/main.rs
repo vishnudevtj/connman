@@ -17,6 +17,8 @@ mod proxy;
 const PROXY_PORT: u16 = 4243;
 const DEFAULT_LISTEN_PORT: u16 = 4242;
 
+pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
+
 #[derive(FromArgs)]
 /// Auto start docker container on TCP request.
 struct ConnMan {
@@ -80,21 +82,11 @@ async fn main() -> anyhow::Result<()> {
 
     let image_option = docker::ImageOption {
         always_pull: connman.pull.unwrap_or(false),
+        service_port: connman.service_port,
         name: connman.image.clone(),
         tag: String::from("latest"),
         credentials: None,
     };
-
-    let proxy = proxy::Proxy::new(
-        listen_port,
-        connman.image.clone(),
-        connman.service_port,
-        PROXY_PORT,
-        connman.docker_host,
-        cert,
-        key,
-        docker_man.sender(),
-    );
 
     let sender = docker_man.sender();
 
@@ -108,6 +100,18 @@ async fn main() -> anyhow::Result<()> {
         match response.1.await {
             Ok(Ok(id)) => {
                 info!("Pulled Container Image : {} : {:?}", image_option.name, id);
+
+                let proxy = proxy::Proxy::new(
+                    listen_port,
+                    connman.image.clone(),
+                    id,
+                    PROXY_PORT,
+                    connman.docker_host,
+                    cert,
+                    key,
+                    sender,
+                );
+
                 proxy.run().await;
             }
             Ok(Err(err)) => {

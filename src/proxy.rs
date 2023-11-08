@@ -21,7 +21,10 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 
-use crate::docker::{self, ContainerId};
+use crate::{
+    docker::{self, ContainerId, ImageId},
+    HASH_KEY,
+};
 
 const MAX_TRIES: usize = 100;
 
@@ -34,10 +37,10 @@ pub struct Proxy {
     // Which port to listen on for incomming connection.
     listen_port: u16,
 
+    // Internal Id representing a registered image
+    image_id: ImageId,
     // Name of the docker image.
     image_name: String,
-    // Internal port on which the challenge listens
-    service_port: u16,
 
     // Port on which the container maps the service port
     proxy_port: u16,
@@ -61,40 +64,39 @@ impl Proxy {
     pub fn new(
         listen_port: u16,
         image_name: String,
-        service_port: u16,
+        image_id: ImageId,
         proxy_port: u16,
         proxy_host: String,
         cert: Option<Vec<Certificate>>,
         key: Option<PrivateKey>,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
-        let hash_key = Key([0xdeadbeef, 0xcafebabe, 0x4242, 0x6969]);
+        let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
         hasher.append(&listen_port.to_le_bytes());
-        hasher.append(&image_name.as_bytes());
-        hasher.append(&service_port.to_le_bytes());
-        hasher.append(&proxy_host.as_bytes());
+        hasher.append(image_name.as_bytes());
+        hasher.append(proxy_host.as_bytes());
         hasher.append(&proxy_port.to_le_bytes());
         let container_name = hasher.finalize64().to_string();
 
         Self {
             listen_port,
             image_name,
-            service_port,
             proxy_port,
             proxy_host,
             container_name,
             cert,
             key,
             docker_man,
+            image_id,
         }
     }
 
     pub async fn run(&self) {
-        info!("Starting Proxy for: \t{}", self.image_name);
-        info!("\tContainer Name: \t{}", self.container_name);
-        info!("\tListen Port:\t{}", self.listen_port);
-        info!("\tProxying to\t{}:{}", self.proxy_host, self.proxy_port);
+        info!("Starting Proxy for:\t{}", self.image_name);
+        info!("\tContainer Name:\t{}", self.container_name);
+        info!("\tListen Port:\t\t{}", self.listen_port);
+        info!("\tProxying to:\t\t{}:{}", self.proxy_host, self.proxy_port);
 
         let socket_addr = format!("0.0.0.0:{}", self.listen_port);
         let listener = TcpListener::bind(&socket_addr)
@@ -114,8 +116,7 @@ impl Proxy {
         }
 
         let option = docker::CreateOption {
-            image_name: self.image_name.clone(),
-            service_port: self.service_port,
+            image_id: self.image_id.clone(),
             port: self.proxy_port,
             container_name: self.container_name.clone(),
         };
