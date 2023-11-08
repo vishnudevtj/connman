@@ -10,7 +10,7 @@ use std::{
 
 use log::{error, info, warn};
 use tokio::{
-    io::{copy, copy_bidirectional, split, AsyncWriteExt},
+    io::{copy, copy_bidirectional, split, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     pin,
     sync::{mpsc::Sender, Mutex},
@@ -25,6 +25,11 @@ use tokio_rustls::{
 use crate::docker::{self, ContainerId};
 
 const MAX_TRIES: usize = 100;
+
+enum SuperStream {
+    Tcp(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
 
 pub struct Proxy {
     // Which port to listen on for incomming connection.
@@ -45,10 +50,10 @@ pub struct Proxy {
     container_name: String,
 
     // Containers Certificate
-    cert: Vec<Certificate>,
+    cert: Option<Vec<Certificate>>,
 
     // Private Key for the certificate
-    key: PrivateKey,
+    key: Option<PrivateKey>,
 
     docker_man: Sender<docker::Msg>,
 }
@@ -61,8 +66,8 @@ impl Proxy {
         proxy_port: u16,
         proxy_host: String,
         container_name: String,
-        cert: Vec<Certificate>,
-        key: PrivateKey,
+        cert: Option<Vec<Certificate>>,
+        key: Option<PrivateKey>,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
         Self {
@@ -90,14 +95,16 @@ impl Proxy {
             self.image_name
         );
 
-        let server_config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(self.cert.clone(), self.key.clone())
-            .map_err(|err| error!("Unable to create server_config : {err}"))
-            .unwrap();
-
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut acceptor = None;
+        if let (Some(cert), Some(key)) = (self.cert.clone(), self.key.clone()) {
+            let server_config = ServerConfig::builder()
+                .with_safe_defaults()
+                .with_no_client_auth()
+                .with_single_cert(cert, key)
+                .map_err(|err| error!("Unable to create server_config : {err}"))
+                .unwrap();
+            acceptor = Some(TlsAcceptor::from(Arc::new(server_config)));
+        }
 
         let option = docker::CreateOption {
             image_name: self.image_name.clone(),
@@ -116,8 +123,6 @@ impl Proxy {
         let response = response.1.await;
         match response {
             Ok(Ok(id)) => {
-                let delay = Duration::from_secs(10);
-
                 let conn_tracker =
                     ConnTrack::new(Duration::from_secs(60), self.docker_man.clone(), id.clone());
                 let no_conn = conn_tracker.no_conn();
@@ -125,25 +130,41 @@ impl Proxy {
 
                 while let Ok((stream, socket)) = listener.accept().await {
                     info!("Got Connection from : {socket}");
-                    let acceptor = acceptor.clone();
-                    let stream = acceptor.accept(stream).await;
-                    match stream {
-                        Ok(stream) => {
-                            let _ = self
-                                .docker_man
-                                .send(docker::Msg::Start(id.clone()))
-                                .await
-                                .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
+                    let super_stream = if let Some(acceptor) = acceptor.clone() {
+                        match acceptor.accept(stream).await {
+                            Err(err) => {
+                                error!("Unable to accept TLS Stream : {err}");
+                                continue;
+                            }
+                            Ok(stream) => SuperStream::Tls(stream),
+                        }
+                    } else {
+                        SuperStream::Tcp(stream)
+                    };
+
+                    let _ = self
+                        .docker_man
+                        .send(docker::Msg::Start(id.clone()))
+                        .await
+                        .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
+                    match super_stream {
+                        SuperStream::Tcp(s) => {
                             tokio::spawn(Proxy::handle_connection(
-                                stream,
+                                s,
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
                                 self.proxy_port,
                                 socket,
                             ));
                         }
-                        Err(err) => {
-                            error!("Unable to accept TLS Stream : {err}");
+                        SuperStream::Tls(s) => {
+                            tokio::spawn(Proxy::handle_connection(
+                                s,
+                                no_conn.clone(),
+                                self.proxy_host.clone(),
+                                self.proxy_port,
+                                socket,
+                            ));
                         }
                     }
                 }
@@ -157,13 +178,15 @@ impl Proxy {
         }
     }
 
-    async fn handle_connection(
-        mut upstream: TlsStream<TcpStream>,
+    async fn handle_connection<T>(
+        mut upstream: T,
         no_conn: Arc<AtomicU64>,
         proxy_host: String,
         proxy_port: u16,
         socket: SocketAddr,
-    ) {
+    ) where
+        T: std::marker::Unpin + AsyncRead + AsyncWrite,
+    {
         let mut no_of_try = MAX_TRIES;
         let instant = Instant::now();
         loop {
@@ -184,13 +207,13 @@ impl Proxy {
                     no_conn.fetch_add(1, Ordering::SeqCst);
 
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
-                        Ok((to_egress, to_ingress)) => {
-                            info!(
-                                "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
-                            );
+                        Ok((_to_egress, _to_ingress)) => {
+                            // info!(
+                            //     "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
+                            // );
                         }
                         Err(err) => {
-                            error!("Error while proxying: {socket} : {err}");
+                            warn!("Error while proxying: {socket} : {err}");
                         }
                     }
 

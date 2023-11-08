@@ -16,7 +16,7 @@ mod docker;
 mod proxy;
 
 const PROXY_PORT: u16 = 4243;
-const LISTEN_PORT: u16 = 443;
+const DEFAULT_LISTEN_PORT: u16 = 4242;
 
 #[derive(FromArgs)]
 /// Auto start docker container on TCP request.
@@ -40,15 +40,20 @@ struct ConnMan {
 
     /// cert file
     #[argh(option, short = 'c')]
-    cert: PathBuf,
+    cert: Option<PathBuf>,
 
     /// key file
     #[argh(option, short = 'k')]
-    key: PathBuf,
+    key: Option<PathBuf>,
 
     /// always pull image
     #[argh(option, short = 'b')]
     pull: Option<bool>,
+
+    /// on which port to listen for incomming
+    /// connection
+    #[argh(option, short = 'l')]
+    listen_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -58,9 +63,16 @@ async fn main() -> anyhow::Result<()> {
     builder.init();
 
     let connman: ConnMan = argh::from_env();
+    let mut cert = None;
+    let mut key = None;
+    let mut listen_port = connman.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
 
-    let cert = load_certificates_from_pem(&connman.cert)?;
-    let key = load_private_key_from_file(&connman.key)?;
+    if let (Some(c), Some(k)) = (connman.cert, connman.key) {
+        info!("Loading Certificate and Private Key");
+        listen_port = 443;
+        cert = Some(load_certificates_from_pem(&c)?);
+        key = Some(load_private_key_from_file(&k)?);
+    }
 
     info!("Starting connman Server 0.1");
 
@@ -69,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     let container_name = String::from("clatter-calculate");
     let proxy = proxy::Proxy::new(
-        LISTEN_PORT,
+        listen_port,
         connman.image.clone(),
         connman.service_port,
         PROXY_PORT,
