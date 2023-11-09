@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -9,6 +9,7 @@ use std::{
 
 use highway::{HighwayHash, HighwayHasher, Key};
 use log::{error, info, warn};
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -98,10 +99,20 @@ impl Proxy {
         info!("\tListen Port:\t\t{}", self.listen_port);
         info!("\tProxying to:\t\t{}:{}", self.proxy_host, self.proxy_port);
 
-        let socket_addr = format!("0.0.0.0:{}", self.listen_port);
-        let listener = TcpListener::bind(&socket_addr)
-            .await
-            .map_err(|err| error!("Unable to Listen on addr: {} : {}", socket_addr, err))
+        let socket_addr = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            self.listen_port,
+        ));
+
+        let socket = Proxy::prepare_socket(socket_addr)
+            .map_err(|err| {
+                error!("Unable to create socket for listening on : {socket_addr}: {err}")
+            })
+            .unwrap();
+
+        let listener = std::net::TcpListener::from(socket);
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|err| error!("Unable to create Tokio TCP Listener from socket2 socket: {err}"))
             .unwrap();
 
         let mut acceptor = None;
@@ -157,7 +168,7 @@ impl Proxy {
                         .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
                     match super_stream {
                         SuperStream::Tcp(s) => {
-                            tokio::spawn(Proxy::handle_connection_with_timeout(
+                            tokio::spawn(Proxy::handle_connection(
                                 s,
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
@@ -166,7 +177,7 @@ impl Proxy {
                             ));
                         }
                         SuperStream::Tls(s) => {
-                            tokio::spawn(Proxy::handle_connection_with_timeout(
+                            tokio::spawn(Proxy::handle_connection(
                                 s,
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
@@ -186,21 +197,23 @@ impl Proxy {
         }
     }
 
-    async fn handle_connection_with_timeout<T>(
-        upstream: T,
-        no_conn: Arc<AtomicU64>,
-        proxy_host: String,
-        proxy_port: u16,
-        socket: SocketAddr,
-    ) where
-        T: std::marker::Unpin + AsyncRead + AsyncWrite,
-    {
-        let _ = timeout(
-            Duration::from_secs(60),
-            Proxy::handle_connection(upstream, no_conn, proxy_host, proxy_port, socket),
-        )
-        .await
-        .map_err(|err| error!("Clossing connection as timeout occured : {socket} :  {err}"));
+    fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_retries(3)
+            .with_interval(Duration::from_secs(10));
+
+        socket.set_tcp_keepalive(&keepalive)?;
+
+        // setting TCP_USER_TIMEOUT  as TCP_KEEPIDLE + TCP_KEEPINTVL * TCP_KEEPCNT
+        // Using this blog as reference : https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die
+        socket.set_tcp_user_timeout(Some(Duration::from_secs(90)))?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&socket_addr.into())?;
+        socket.listen(128)?;
+
+        Ok(socket)
     }
 
     async fn handle_connection<T>(
