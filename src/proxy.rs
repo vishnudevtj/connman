@@ -13,7 +13,7 @@ use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc::Sender,
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 use tokio_rustls::{
     rustls::{Certificate, PrivateKey, ServerConfig},
@@ -157,7 +157,7 @@ impl Proxy {
                         .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
                     match super_stream {
                         SuperStream::Tcp(s) => {
-                            tokio::spawn(Proxy::handle_connection(
+                            tokio::spawn(Proxy::handle_connection_with_timeout(
                                 s,
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
@@ -166,7 +166,7 @@ impl Proxy {
                             ));
                         }
                         SuperStream::Tls(s) => {
-                            tokio::spawn(Proxy::handle_connection(
+                            tokio::spawn(Proxy::handle_connection_with_timeout(
                                 s,
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
@@ -184,6 +184,23 @@ impl Proxy {
                 error!("Error while receiving message from DockerMan")
             }
         }
+    }
+
+    async fn handle_connection_with_timeout<T>(
+        upstream: T,
+        no_conn: Arc<AtomicU64>,
+        proxy_host: String,
+        proxy_port: u16,
+        socket: SocketAddr,
+    ) where
+        T: std::marker::Unpin + AsyncRead + AsyncWrite,
+    {
+        let _ = timeout(
+            Duration::from_secs(60),
+            Proxy::handle_connection(upstream, no_conn, proxy_host, proxy_port, socket),
+        )
+        .await
+        .map_err(|err| error!("Clossing connection as timeout occured : {socket} :  {err}"));
     }
 
     async fn handle_connection<T>(
@@ -214,8 +231,11 @@ impl Proxy {
                     // Increment the no of connection.
                     no_conn.fetch_add(1, Ordering::SeqCst);
 
+                    // Set timeout for the stream.
+
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
                         Ok((_to_egress, _to_ingress)) => {
+
                             // info!(
                             //     "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
                             // );
