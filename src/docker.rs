@@ -12,7 +12,7 @@ use bollard::{
 };
 use highway::HighwayHash;
 use highway::{HighwayHasher, Key};
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -151,22 +151,38 @@ impl DockerMan {
                 Msg::Start(id) => {
                     let sender = self.sender();
                     let docker = self.docker.clone();
-                    self.status.get(&id).map(|status| {
-                        // If the container is not running
-                        if !status {
-                            tokio::spawn(DockerMan::start_container(docker, id, sender));
-                        }
-                    });
+                    let _ = self
+                        .status
+                        .get(&id)
+                        .map(|status| {
+                            // Only try to start the contaienr if it's in stoped state.
+                            if !status {
+                                tokio::spawn(DockerMan::start_container(
+                                    docker,
+                                    id.clone(),
+                                    sender,
+                                ));
+                            }
+                        })
+                        .ok_or_else(|| {
+                            warn!("Got invalid ContainerId: {}", id.0);
+                        });
                 }
                 Msg::Stop(id) => {
                     let sender = self.sender();
                     let docker = self.docker.clone();
-                    self.status.get(&id).map(|status| {
-                        // If the container is running
-                        if *status {
-                            tokio::spawn(DockerMan::stop_container(docker, id, sender));
-                        }
-                    });
+                    let _ = self
+                        .status
+                        .get(&id)
+                        .map(|status| {
+                            // Only try to stop the container if it's in a running state.
+                            if *status {
+                                tokio::spawn(DockerMan::stop_container(docker, id.clone(), sender));
+                            }
+                        })
+                        .ok_or_else(|| {
+                            warn!("Got invalid ContainerId: {}", id.0);
+                        });
                 }
 
                 Msg::UpdateStatus(id, status) => {

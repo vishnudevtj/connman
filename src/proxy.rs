@@ -310,6 +310,11 @@ impl ConnTrack {
                         .send(docker::Msg::Stop(self.container_id.clone()))
                         .await
                         .map_err(|err| error!("Unable to send message to DockerMan: {}", err));
+
+                    // Only send the next message after an entire idle period.
+                    // The container takes some time to shutdown properly. This is to make sure we don't
+                    // send multiple stop signals within that time.
+                    last_activity = Instant::now();
                 }
             }
 
