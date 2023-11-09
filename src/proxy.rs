@@ -200,7 +200,7 @@ impl Proxy {
     fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(30))
+            .with_time(Duration::from_secs(10))
             .with_retries(3)
             .with_interval(Duration::from_secs(10));
 
@@ -208,7 +208,7 @@ impl Proxy {
 
         // setting TCP_USER_TIMEOUT  as TCP_KEEPIDLE + TCP_KEEPINTVL * TCP_KEEPCNT
         // Using this blog as reference : https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die
-        socket.set_tcp_user_timeout(Some(Duration::from_secs(60)))?;
+        socket.set_tcp_user_timeout(Some(Duration::from_secs(40)))?;
         socket.set_nonblocking(true)?;
         socket.bind(&socket_addr.into())?;
         socket.listen(128)?;
