@@ -7,6 +7,7 @@ use std::{
 use anyhow::anyhow;
 use argh::FromArgs;
 use env_logger::Builder;
+use fern::Dispatch;
 use log::{error, info, LevelFilter};
 
 use tokio_rustls::rustls::{Certificate, PrivateKey};
@@ -59,9 +60,11 @@ struct ConnMan {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut builder = Builder::from_default_env();
-    builder.filter_level(LevelFilter::Info);
-    builder.init();
+    // let mut builder = Builder::from_default_env();
+    // builder.filter_level(LevelFilter::Info);
+    // builder.init();
+
+    setup_logger()?;
 
     let connman: ConnMan = argh::from_env();
     let mut cert = None;
@@ -149,4 +152,24 @@ fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
             path
         )),
     }
+}
+
+fn setup_logger() -> Result<(), fern::InitError> {
+    // Set up the logger for both stdout and a log file
+    Dispatch::new()
+        // Output to stdout
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}] {}",
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(LevelFilter::Info)
+        .chain(std::io::stdout())
+        // Output to a log file
+        .chain(fern::log_file("output.log")?)
+        .apply()?;
+    Ok(())
 }
