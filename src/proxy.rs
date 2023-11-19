@@ -82,6 +82,10 @@ impl Proxy {
         hasher.append(image_name.as_bytes());
         hasher.append(proxy_host.as_bytes());
         hasher.append(&proxy_port.to_le_bytes());
+        if let Some(env) = env.as_ref() {
+            hasher.append(env.key.as_bytes());
+            hasher.append(env.value.as_bytes());
+        };
         let container_name = hasher.finalize64().to_string();
 
         Self {
