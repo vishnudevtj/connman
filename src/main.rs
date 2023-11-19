@@ -12,6 +12,8 @@ use log::{error, info, LevelFilter};
 
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
+use crate::docker::Env;
+
 mod docker;
 mod proxy;
 
@@ -45,7 +47,7 @@ struct ConnMan {
     cert: Option<PathBuf>,
 
     /// key file
-    #[argh(option, short = 'k')]
+    #[argh(option)]
     key: Option<PathBuf>,
 
     /// always pull image
@@ -56,6 +58,16 @@ struct ConnMan {
     /// connection
     #[argh(option, short = 'l')]
     listen_port: Option<u16>,
+
+    /// name of the environment variable on which the challenge
+    /// expect a flag
+    #[argh(option, short = 'k')]
+    env_key: Option<String>,
+
+    /// flag value which should be passed as the value for the
+    /// environment variable epecified by the --env_kay option
+    #[argh(option, short = 'v')]
+    env_value: Option<String>,
 }
 
 #[tokio::main]
@@ -104,6 +116,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(Ok(id)) => {
                 info!("Pulled Container Image : {} : {:?}", image_option.name, id);
 
+                let env = if let (Some(key), Some(value)) = (connman.env_key, connman.env_value) {
+                    Some(Env { key, value })
+                } else {
+                    None
+                };
+
                 let proxy = proxy::Proxy::new(
                     listen_port,
                     connman.image.clone(),
@@ -112,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
                     connman.docker_host,
                     cert,
                     key,
+                    env,
                     sender,
                 );
 

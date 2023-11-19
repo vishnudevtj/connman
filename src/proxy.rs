@@ -23,7 +23,7 @@ use tokio_rustls::{
 };
 
 use crate::{
-    docker::{self, ContainerId, ImageId},
+    docker::{self, ContainerId, Env, ImageId},
     HASH_KEY,
 };
 
@@ -58,6 +58,9 @@ pub struct Proxy {
     // Private Key for the certificate
     key: Option<PrivateKey>,
 
+    // Environment variable contain flag
+    env: Option<Env>,
+
     docker_man: Sender<docker::Msg>,
 }
 
@@ -70,6 +73,7 @@ impl Proxy {
         proxy_host: String,
         cert: Option<Vec<Certificate>>,
         key: Option<PrivateKey>,
+        env: Option<Env>,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
         let hash_key = Key(HASH_KEY);
@@ -89,6 +93,7 @@ impl Proxy {
             cert,
             key,
             docker_man,
+            env,
             image_id,
         }
     }
@@ -129,6 +134,7 @@ impl Proxy {
         let option = docker::CreateOption {
             image_id: self.image_id.clone(),
             port: self.proxy_port,
+            env: self.env.clone(),
             container_name: self.container_name.clone(),
         };
 

@@ -57,8 +57,23 @@ pub struct CreateOption {
     // Name of the container
     pub container_name: String,
 
+    // Env variable mapping
+    pub env: Option<Env>,
+
     // Port binding on host
     pub port: u16,
+}
+
+#[derive(Clone)]
+pub struct Env {
+    pub key: String,
+    pub value: String,
+}
+
+impl Env {
+    fn to_string(&self) -> String {
+        format!("{}={}", self.key, self.value)
+    }
 }
 
 // Represend an Id for a docker container
@@ -280,8 +295,10 @@ impl DockerMan {
             ..Default::default()
         });
 
+        let env = options.env.map(|x| vec![x.to_string()]);
         let config = container::Config {
             image: Some(image_option.name.clone()),
+            env,
             host_config,
             exposed_ports: Some(HashMap::from([(service_port, HashMap::new())])),
             ..Default::default()
