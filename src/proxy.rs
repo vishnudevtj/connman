@@ -1,4 +1,5 @@
 use std::{
+    marker::Unpin,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -9,6 +10,8 @@ use std::{
 
 use highway::{HighwayHash, HighwayHasher, Key};
 use log::{error, info, warn};
+use pin_project::pin_project;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -82,10 +85,12 @@ impl Proxy {
         hasher.append(image_name.as_bytes());
         hasher.append(proxy_host.as_bytes());
         hasher.append(&proxy_port.to_le_bytes());
+
         if let Some(env) = env.as_ref() {
             hasher.append(env.key.as_bytes());
             hasher.append(env.value.as_bytes());
         };
+
         let container_name = hasher.finalize64().to_string();
 
         Self {
@@ -149,6 +154,12 @@ impl Proxy {
             .await
             .map_err(|err| error!("Unable to send Msg to DockerMan: {}", err));
 
+        let flag = self
+            .env
+            .as_ref()
+            .map(|x| Vec::from(x.value.as_bytes()))
+            .unwrap_or_default();
+
         let response = response.1.await;
         match response {
             Ok(Ok(id)) => {
@@ -180,6 +191,7 @@ impl Proxy {
                         SuperStream::Tcp(s) => {
                             tokio::spawn(Proxy::handle_connection(
                                 s,
+                                flag.clone(),
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
                                 self.proxy_port,
@@ -189,6 +201,7 @@ impl Proxy {
                         SuperStream::Tls(s) => {
                             tokio::spawn(Proxy::handle_connection(
                                 s,
+                                flag.clone(),
                                 no_conn.clone(),
                                 self.proxy_host.clone(),
                                 self.proxy_port,
@@ -228,12 +241,13 @@ impl Proxy {
 
     async fn handle_connection<T>(
         mut upstream: T,
+        flag: Vec<u8>,
         no_conn: Arc<AtomicU64>,
         proxy_host: String,
         proxy_port: u16,
         socket: SocketAddr,
     ) where
-        T: std::marker::Unpin + AsyncRead + AsyncWrite,
+        T: Unpin + AsyncRead + AsyncWrite,
     {
         let mut no_of_try = MAX_TRIES;
         let instant = Instant::now();
@@ -255,6 +269,8 @@ impl Proxy {
                     no_conn.fetch_add(1, Ordering::SeqCst);
 
                     // Set timeout for the stream.
+
+                    let mut proxy_stream = FlagTransformer::new(flag, proxy_stream);
 
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
                         Ok((_to_egress, _to_ingress)) => {
@@ -363,5 +379,87 @@ impl ConnTrack {
 
             sleep(self.interval).await;
         }
+    }
+}
+
+#[pin_project]
+struct FlagTransformer<T> {
+    from: Vec<u8>,
+    to: Vec<u8>,
+    #[pin]
+    stream: T,
+}
+
+impl<T> FlagTransformer<T>
+where
+    T: Unpin + AsyncRead + AsyncWrite,
+{
+    fn new(from: Vec<u8>, stream: T) -> Self {
+        let rng = thread_rng();
+        let to: Vec<u8> = rng.sample_iter(&Alphanumeric).take(from.len()).collect();
+
+        Self { from, stream, to }
+    }
+}
+
+impl<T> AsyncRead for FlagTransformer<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.project();
+        let result = AsyncRead::poll_read(this.stream, cx, buf);
+
+        if result.is_ready() && this.from.len() != 0 {
+            let buffer = buf.filled_mut();
+
+            let mut i = 0;
+            let len = this.from.len();
+            while i + len <= buffer.len() {
+                if &buffer[i..(i + len)] == this.from {
+                    buffer[i..(i + len)].copy_from_slice(this.to);
+                    // Replace only once.
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl<T> AsyncWrite for FlagTransformer<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let this = self.project();
+        AsyncWrite::poll_write(this.stream, cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let this = self.project();
+        AsyncWrite::poll_flush(this.stream, cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        let this = self.project();
+        AsyncWrite::poll_shutdown(this.stream, cx)
     }
 }
