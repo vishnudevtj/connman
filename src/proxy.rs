@@ -240,7 +240,7 @@ impl Proxy {
     }
 
     async fn handle_connection<T>(
-        mut upstream: T,
+        upstream: T,
         flag: Vec<u8>,
         no_conn: Arc<AtomicU64>,
         proxy_host: String,
@@ -269,6 +269,9 @@ impl Proxy {
                     no_conn.fetch_add(1, Ordering::SeqCst);
 
                     // Set timeout for the stream.
+                    let mut upstream = tokio_io_timeout::TimeoutStream::new(upstream);
+                    upstream.set_read_timeout(Some(Duration::from_secs(120)));
+                    let mut upstream = Box::pin(upstream);
 
                     let mut proxy_stream = FlagTransformer::new(flag, proxy_stream);
 
