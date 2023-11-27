@@ -15,9 +15,9 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::mpsc::Sender,
-    time::{sleep, timeout, Instant},
+    time::{sleep, Instant},
 };
 use tokio_rustls::{
     rustls::{Certificate, PrivateKey, ServerConfig},
@@ -258,7 +258,7 @@ impl Proxy {
             no_of_try -= 1;
 
             match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
-                Ok(mut proxy_stream) => {
+                Ok(proxy_stream) => {
                     info!(
                         "Proxied Connection after try: {} : {:?}",
                         MAX_TRIES - no_of_try,
@@ -414,7 +414,7 @@ where
         let this = self.project();
         let result = AsyncRead::poll_read(this.stream, cx, buf);
 
-        if result.is_ready() && this.from.len() != 0 {
+        if result.is_ready() && !this.from.is_empty() {
             let buffer = buf.filled_mut();
 
             let mut i = 0;

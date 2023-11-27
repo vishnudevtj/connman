@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+};
 
 use bollard::{
     auth::DockerCredentials,
@@ -70,9 +73,9 @@ pub struct Env {
     pub value: String,
 }
 
-impl Env {
-    fn to_string(&self) -> String {
-        format!("{}={}", self.key, self.value)
+impl Display for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("{}={}", self.key, self.value))
     }
 }
 
@@ -213,10 +216,11 @@ impl DockerMan {
     async fn start_container(docker: Docker, id: ContainerId, sender: Sender<Msg>) {
         info!("Starting container: {}", id.0);
 
-        if let Ok(_) = docker
+        if docker
             .start_container(&id.0, None::<StartContainerOptions<String>>)
             .await
             .map_err(|err| error!("Unable to start container: {} : {}", id.0, err))
+            .is_ok()
         {
             // Update the status of container as running.
             let _ = sender
@@ -233,10 +237,11 @@ impl DockerMan {
     async fn stop_container(docker: Docker, id: ContainerId, sender: Sender<Msg>) {
         info!("Stoping container: {}", id.0);
 
-        if let Ok(_) = docker
+        if docker
             .stop_container(&id.0, None::<StopContainerOptions>)
             .await
             .map_err(|err| error!("Unable to stop container: {} : {}", id.0, err))
+            .is_ok()
         {
             // Update the status of container as stopped.
             let _ = sender

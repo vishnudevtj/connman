@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::anyhow;
 use argh::FromArgs;
-use env_logger::Builder;
+
 use fern::Dispatch;
 use log::{error, info, LevelFilter};
 
