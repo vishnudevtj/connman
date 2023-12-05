@@ -100,21 +100,22 @@ impl TlsListener {
             .context("Unable to create ServerConfig")?;
 
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        tokio::select! {
-            Some(msg) = self.conn.1.recv() => {
-                self.handle_tls_msg(msg)
-            }
-            Ok((stream, socket)) = listener.accept() => {
-                self.handle_connection(&acceptor, stream, socket).await;
+        loop {
+            tokio::select! {
+                Some(msg) = self.conn.1.recv() => {
+                    self.handle_tls_msg(msg)
+                }
+                Ok((stream, socket)) = listener.accept() => {
+                    self.handle_connection(&acceptor, stream, socket).await;
+                }
             }
         }
-
-        Ok(())
     }
 
     fn handle_tls_msg(&mut self, msg: TlsMsg) {
         match msg {
             TlsMsg::Add(host, proxy) => {
+                info!("Added host<{}> for proxing by TLSListener", host);
                 self.map.insert(host, Arc::new(proxy));
             }
         }
