@@ -3,6 +3,8 @@ use std::{
     fmt::{self, Display},
 };
 
+pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
+
 use bollard::{
     auth::DockerCredentials,
     container::{
@@ -20,8 +22,6 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
-
-use crate::HASH_KEY;
 
 const CONTAINER_NAME_PREFIX: &str = "connman-";
 
@@ -81,24 +81,29 @@ impl Display for Env {
 
 // Represend an Id for a docker container
 #[derive(Clone, Eq, PartialEq, Hash)]
-pub struct ContainerId(String);
+pub struct ContainerId(pub String);
 
 // Represend an Id for a docker container
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ImageId(String);
 
+#[derive(Debug)]
 pub enum Error {
     Internal(bollard::errors::Error),
     Pull(String),
     ImageNotFound,
 }
 
+impl std::error::Error for Error {}
+
 pub struct DockerMan {
     docker: Docker,
-
+    // Host address of docker backend.
+    host: String,
+    // Port for connecting to docker backend.
+    port: u16,
     // Tracks the running status of the container.
     status: HashMap<ContainerId, bool>,
-
     // Registry containing details of all the images
     // in this docker host
     registry: HashMap<ImageId, ImageOption>,
@@ -107,22 +112,29 @@ pub struct DockerMan {
 }
 
 impl DockerMan {
-    pub fn new(addr: String) -> anyhow::Result<Self> {
-        let docker = Docker::connect_with_http(&addr, 30, API_DEFAULT_VERSION)?;
-
-        // let docker = Docker::connect_with_local_defaults()
-        //     .context("Unable to connect to local docker socket")?;
-
+    pub fn new(host: String, port: u16) -> anyhow::Result<Self> {
+        let addr = format!("http://{}:{}", host, port);
+        let docker = bollard::Docker::connect_with_http(&addr, 30, API_DEFAULT_VERSION)?;
         let status = HashMap::new();
         let conn = mpsc::channel(10);
         let registry = HashMap::new();
 
         Ok(Self {
+            host,
+            port,
             docker,
             status,
             registry,
             conn,
         })
+    }
+
+    pub fn host(&self) -> String {
+        self.host.clone()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub fn sender(&self) -> Sender<Msg> {

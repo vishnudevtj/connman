@@ -7,12 +7,14 @@ use std::{
 use anyhow::anyhow;
 use argh::FromArgs;
 
+use connman::{docker::Env, ConnmanBuilder, TcpPorxy, TlsProxy};
 use fern::Dispatch;
 use log::{error, info, LevelFilter};
 
+use tokio::sync::oneshot;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
-use crate::docker::Env;
+use connman::docker::ImageOption;
 
 mod docker;
 mod proxy;
@@ -20,11 +22,9 @@ mod proxy;
 const PROXY_PORT: u16 = 4243;
 const DEFAULT_LISTEN_PORT: u16 = 4242;
 
-pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
-
 #[derive(FromArgs)]
 /// Auto start docker container on TCP request.
-struct ConnMan {
+struct ConnManArg {
     /// address of docker HTTP API server   
     #[argh(option, short = 'd')]
     docker_host: String,
@@ -72,82 +72,73 @@ struct ConnMan {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // let mut builder = Builder::from_default_env();
-    // builder.filter_level(LevelFilter::Info);
-    // builder.init();
-
     setup_logger()?;
 
-    let connman: ConnMan = argh::from_env();
-    let mut cert = None;
-    let mut key = None;
-    let mut listen_port = connman.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
+    let mut tls_enabled = false;
+    let arg: ConnManArg = argh::from_env();
+    let mut listen_port = arg.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
 
-    if let (Some(c), Some(k)) = (connman.cert, connman.key) {
+    let env = if let (Some(key), Some(value)) = (arg.env_key, arg.env_value) {
+        Some(Env { key, value })
+    } else {
+        None
+    };
+
+    let mut connman = ConnmanBuilder::new();
+    let msg = if let (Some(c), Some(k)) = (arg.cert, arg.key) {
         info!("Loading Certificate and Private Key");
+        info!("Overriding Listen port to : 443");
         listen_port = 443;
-        cert = Some(load_certificates_from_pem(&c)?);
-        key = Some(load_private_key_from_file(&k)?);
-    }
+        let cert = load_certificates_from_pem(&c)?;
+        let key = load_private_key_from_file(&k)?;
+        connman = connman.with_tls(cert, key);
+        tls_enabled = true;
+    };
 
-    info!("Starting connman Server 0.2");
+    // Add docker backend.
+    let connman = connman.with_docker(arg.docker_host, arg.docker_port)?;
+    let connman = connman.build()?;
+    let sender = connman.sender();
+    tokio::spawn(connman.run());
 
-    let docker_socket_addr = format!("{}:{}", &connman.docker_host, connman.docker_port);
-    let docker_man = docker::DockerMan::new(docker_socket_addr)?;
+    info!("Starting connman Server 0.3");
 
-    let image_option = docker::ImageOption {
-        always_pull: connman.pull.unwrap_or(false),
-        service_port: connman.service_port,
-        name: connman.image.clone(),
+    let image_option = ImageOption {
+        always_pull: arg.pull.unwrap_or(false),
+        service_port: arg.service_port,
+        name: arg.image.clone(),
         tag: String::from("latest"),
         credentials: None,
     };
 
-    let sender = docker_man.sender();
+    let channel = oneshot::channel();
+    let msg = connman::Msg::RegisterImage(image_option, channel.0);
+    sender.send(msg).await?;
+    let image_id = channel.1.await??;
 
-    let fut = async move {
-        let response = tokio::sync::oneshot::channel();
-        let _ = sender
-            .send(docker::Msg::Register(image_option.clone(), response.0))
-            .await
-            .map_err(|err| error!("Unable to send Msg::Register to docker_man: {}", err));
-
-        match response.1.await {
-            Ok(Ok(id)) => {
-                info!("Pulled Container Image : {} : {:?}", image_option.name, id);
-
-                let env = if let (Some(key), Some(value)) = (connman.env_key, connman.env_value) {
-                    Some(Env { key, value })
-                } else {
-                    None
-                };
-
-                let proxy = proxy::Proxy::new(
-                    listen_port,
-                    connman.image.clone(),
-                    id,
-                    PROXY_PORT,
-                    connman.docker_host,
-                    cert,
-                    key,
-                    env,
-                    sender,
-                );
-
-                proxy.run().await;
-            }
-            Ok(Err(err)) => {
-                error!("Unable to pull image: {err}");
-            }
-            Err(err) => {
-                error!("Error while receiving reponse from docker_man: {err}")
-            }
-        }
+    let channel = oneshot::channel();
+    let msg = if tls_enabled {
+        let tls_proxy = TlsProxy {
+            host: String::from(""),
+            image: image_id,
+            env,
+        };
+        connman::Msg::TlsProxy(tls_proxy, channel.0)
+    } else {
+        let tcp_proxy = TcpPorxy {
+            listen_port,
+            image: image_id,
+            env,
+        };
+        connman::Msg::TcpPorxy(tcp_proxy, channel.0)
     };
+    sender.send(msg).await?;
+    let url = channel.1.await??;
+    info!("Url: {}", url);
 
-    tokio::spawn(fut);
-
-    docker_man.run().await;
+    // Wait indefinetly
+    let channel = oneshot::channel::<bool>();
+    let _ = channel.1.await;
     Ok(())
 }
 

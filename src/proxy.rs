@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     marker::Unpin,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
@@ -8,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{anyhow, Context};
 use highway::{HighwayHash, HighwayHasher, Key};
 use log::{error, info, warn};
 use pin_project::pin_project;
@@ -16,7 +18,10 @@ use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc::Sender,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
     time::{sleep, Instant},
 };
 use tokio_rustls::{
@@ -25,10 +30,7 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 
-use crate::{
-    docker::{self, ContainerId, Env, ImageId},
-    HASH_KEY,
-};
+use crate::docker::{self, ContainerId, Env};
 
 const MAX_TRIES: usize = 100;
 
@@ -37,212 +39,270 @@ enum SuperStream {
     Tls(TlsStream<TcpStream>),
 }
 
-pub struct Proxy {
+pub enum TlsMsg {
+    Add(String, Proxy),
+}
+
+// Listens for TLS stream and proxy the connection.
+// TLS Listener can proxy multiple connection using
+// SNI based routing, if a wildcard certificate is provided.
+pub struct TlsListener {
     // Which port to listen on for incomming connection.
     listen_port: u16,
 
-    // Internal Id representing a registered image
-    image_id: ImageId,
-    // Name of the docker image.
-    image_name: String,
-
-    // Port on which the container maps the service port
-    proxy_port: u16,
-
-    // Address on which the container starts
-    proxy_host: String,
-
-    // Container name
-    container_name: String,
-
     // Containers Certificate
-    cert: Option<Vec<Certificate>>,
+    cert: Vec<Certificate>,
 
     // Private Key for the certificate
-    key: Option<PrivateKey>,
+    key: PrivateKey,
 
-    // Environment variable contain flag
-    env: Option<Env>,
+    // Mapping between SNI Host name and Proxy
+    map: HashMap<String, Arc<Proxy>>,
 
-    docker_man: Sender<docker::Msg>,
+    conn: (Sender<TlsMsg>, Receiver<TlsMsg>),
 }
 
-impl Proxy {
-    pub fn new(
-        listen_port: u16,
-        image_name: String,
-        image_id: ImageId,
-        proxy_port: u16,
-        proxy_host: String,
-        cert: Option<Vec<Certificate>>,
-        key: Option<PrivateKey>,
-        env: Option<Env>,
-        docker_man: Sender<docker::Msg>,
-    ) -> Self {
-        let hash_key = Key(HASH_KEY);
-        let mut hasher = HighwayHasher::new(hash_key);
-        hasher.append(&listen_port.to_le_bytes());
-        hasher.append(image_name.as_bytes());
-        hasher.append(proxy_host.as_bytes());
-        hasher.append(&proxy_port.to_le_bytes());
-
-        if let Some(env) = env.as_ref() {
-            hasher.append(env.key.as_bytes());
-            hasher.append(env.value.as_bytes());
-        };
-
-        let container_name = hasher.finalize64().to_string();
-
+impl TlsListener {
+    pub fn new(listen_port: u16, cert: Vec<Certificate>, key: PrivateKey) -> Self {
+        let map = HashMap::new();
+        let conn = mpsc::channel(10);
         Self {
             listen_port,
-            image_name,
-            proxy_port,
-            proxy_host,
-            container_name,
             cert,
             key,
-            docker_man,
-            env,
-            image_id,
+            map,
+            conn,
         }
     }
 
-    pub async fn run(&self) {
-        info!("Starting Proxy for:\t{}", self.image_name);
-        info!("\tContainer Name:\t{}", self.container_name);
+    pub fn sender(&self) -> Sender<TlsMsg> {
+        self.conn.0.clone()
+    }
+
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        info!("Starting TLSListener!");
         info!("\tListen Port:\t\t{}", self.listen_port);
-        info!("\tProxying to:\t\t{}:{}", self.proxy_host, self.proxy_port);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
             self.listen_port,
         ));
 
-        let socket = Proxy::prepare_socket(socket_addr)
-            .map_err(|err| {
-                error!("Unable to create socket for listening on : {socket_addr}: {err}")
-            })
-            .unwrap();
+        let socket = prepare_socket(socket_addr).context(format!(
+            "Unable to create socket for listening on : {socket_addr}"
+        ))?;
 
         let listener = std::net::TcpListener::from(socket);
         let listener = tokio::net::TcpListener::from_std(listener)
-            .map_err(|err| error!("Unable to create Tokio TCP Listener from socket2 socket: {err}"))
-            .unwrap();
+            .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
 
-        let mut acceptor = None;
-        if let (Some(cert), Some(key)) = (self.cert.clone(), self.key.clone()) {
-            let server_config = ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth()
-                .with_single_cert(cert, key)
-                .map_err(|err| error!("Unable to create server_config : {err}"))
-                .unwrap();
-            acceptor = Some(TlsAcceptor::from(Arc::new(server_config)));
+        let server_config = ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(self.cert.clone(), self.key.clone())
+            .context("Unable to create ServerConfig")?;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        tokio::select! {
+            Some(msg) = self.conn.1.recv() => {
+                self.handle_tls_msg(msg)
+            }
+            Ok((stream, socket)) = listener.accept() => {
+                self.handle_connection(&acceptor, stream, socket).await;
+            }
         }
 
-        let option = docker::CreateOption {
-            image_id: self.image_id.clone(),
-            port: self.proxy_port,
-            env: self.env.clone(),
-            container_name: self.container_name.clone(),
-        };
+        Ok(())
+    }
 
-        let response = tokio::sync::oneshot::channel();
-        let _ = self
-            .docker_man
-            .send(docker::Msg::Create(option, response.0))
-            .await
-            .map_err(|err| error!("Unable to send Msg to DockerMan: {}", err));
+    fn handle_tls_msg(&mut self, msg: TlsMsg) {}
+    async fn handle_connection(
+        &self,
+        acceptor: &TlsAcceptor,
+        stream: TcpStream,
+        socket: SocketAddr,
+    ) {
+        info!("Got Connection from: {socket}");
+        match acceptor.accept(stream).await {
+            Err(err) => {
+                error!("Unable to accept TLS Stream: {err}");
+                return;
+            }
+            Ok(stream) => {
+                let (_, connection) = stream.get_ref();
+                if let Some(sni) = connection.server_name() {
+                    info!("Got Connection with SNI: {sni}");
+                    if let Some(proxy) = self.map.get(sni).cloned() {
+                        let stream = SuperStream::Tls(stream);
+                        let fut = async move {
+                            let proxy = proxy;
+                            proxy.run(socket, stream).await;
+                        };
+                        tokio::spawn(fut);
+                    } else {
+                        warn!("Unable to find Proxy for SNI: {sni}");
+                    }
+                }
+            }
+        }
+    }
+}
 
+// Listens for a TCP Stream an proxy the connection.
+pub struct TcpListener {
+    // Which port to listen on for incomming connection.
+    listen_port: u16,
+    // Proxy the connection.
+    proxy: Arc<Proxy>,
+}
+
+impl TcpListener {
+    pub fn new(listen_port: u16, proxy: Proxy) -> Self {
+        let proxy = Arc::new(proxy);
+        Self { listen_port, proxy }
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        info!("Starting TCPListener");
+        info!("\tListen Port:\t\t{}", self.listen_port);
+
+        let socket_addr = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            self.listen_port,
+        ));
+
+        let socket = prepare_socket(socket_addr).context(format!(
+            "Unable to create socket for listening on : {socket_addr}"
+        ))?;
+
+        let listener = std::net::TcpListener::from(socket);
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
+
+        while let Ok((stream, socket)) = listener.accept().await {
+            info!("Got Connection from: {socket}");
+            let stream = SuperStream::Tcp(stream);
+            let proxy = self.proxy.clone();
+            let fut = async move {
+                proxy.run(socket, stream).await;
+            };
+            tokio::spawn(fut);
+        }
+        Ok(())
+    }
+}
+
+fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_retries(3)
+        .with_interval(Duration::from_secs(10));
+
+    socket.set_tcp_keepalive(&keepalive)?;
+
+    // setting TCP_USER_TIMEOUT as TCP_KEEPIDLE + TCP_KEEPINTVL * TCP_KEEPCNT
+    // Using this blog as reference :
+    // https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die
+    socket.set_tcp_user_timeout(Some(Duration::from_secs(40)))?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&socket_addr.into())?;
+    socket.listen(128)?;
+
+    Ok(socket)
+}
+
+#[derive(Clone)]
+pub struct Proxy {
+    // Internal Id of the container to which the traffic should be
+    // proxied.
+    container_id: ContainerId,
+    // Port on which the container maps the service port
+    proxy_port: u16,
+
+    // Address on which the container starts
+    proxy_host: String,
+
+    // Environment variable contain flag
+    env: Option<Env>,
+
+    // Sender to communicate with DockerMan to start
+    // containers when a new request is received.
+    docker_man: Sender<docker::Msg>,
+
+    // Tracks the number of active connection for this proxy.
+    active_connection: ActiveConn,
+}
+
+impl Proxy {
+    pub fn new(
+        container_id: ContainerId,
+        proxy_port: u16,
+        proxy_host: String,
+        env: Option<Env>,
+        docker_man: Sender<docker::Msg>,
+    ) -> Self {
+        let conn_track = ConnTrack::new(
+            Duration::from_secs(60),
+            docker_man.clone(),
+            container_id.clone(),
+        );
+
+        let active_connection = conn_track.no_conn();
+        tokio::spawn(conn_track.run());
+
+        Self {
+            container_id,
+            proxy_port,
+            proxy_host,
+            docker_man,
+            env,
+            active_connection,
+        }
+    }
+
+    async fn run(&self, socket: SocketAddr, super_stream: SuperStream) {
+        let no_conn = self.active_connection.clone();
         let flag = self
             .env
             .as_ref()
             .map(|x| Vec::from(x.value.as_bytes()))
             .unwrap_or_default();
 
-        let response = response.1.await;
-        match response {
-            Ok(Ok(id)) => {
-                let conn_tracker =
-                    ConnTrack::new(Duration::from_secs(60), self.docker_man.clone(), id.clone());
-                let no_conn = conn_tracker.no_conn();
-                tokio::spawn(conn_tracker.run());
+        let _ = self
+            .docker_man
+            .send(docker::Msg::Start(self.container_id.clone()))
+            .await
+            .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
 
-                while let Ok((stream, socket)) = listener.accept().await {
-                    info!("Got Connection from : {socket}");
-                    let super_stream = if let Some(acceptor) = acceptor.clone() {
-                        match acceptor.accept(stream).await {
-                            Err(err) => {
-                                error!("Unable to accept TLS Stream : {err}");
-                                continue;
-                            }
-                            Ok(stream) => SuperStream::Tls(stream),
-                        }
-                    } else {
-                        SuperStream::Tcp(stream)
-                    };
-
-                    let _ = self
-                        .docker_man
-                        .send(docker::Msg::Start(id.clone()))
-                        .await
-                        .map_err(|err| error!("Unable to send Msg to DockerMan {}", err));
-                    match super_stream {
-                        SuperStream::Tcp(s) => {
-                            tokio::spawn(Proxy::handle_connection(
-                                s,
-                                flag.clone(),
-                                no_conn.clone(),
-                                self.proxy_host.clone(),
-                                self.proxy_port,
-                                socket,
-                            ));
-                        }
-                        SuperStream::Tls(s) => {
-                            tokio::spawn(Proxy::handle_connection(
-                                s,
-                                flag.clone(),
-                                no_conn.clone(),
-                                self.proxy_host.clone(),
-                                self.proxy_port,
-                                socket,
-                            ));
-                        }
-                    }
-                }
+        match super_stream {
+            SuperStream::Tcp(s) => {
+                tokio::spawn(Proxy::handle_connection(
+                    s,
+                    flag.clone(),
+                    no_conn.clone(),
+                    self.proxy_host.clone(),
+                    self.proxy_port,
+                    socket,
+                ));
             }
-            Ok(Err(err)) => {
-                error!("Unable to create container: {}", err);
-            }
-            Err(_) => {
-                error!("Error while receiving message from DockerMan")
+            SuperStream::Tls(s) => {
+                tokio::spawn(Proxy::handle_connection(
+                    s,
+                    flag.clone(),
+                    no_conn.clone(),
+                    self.proxy_host.clone(),
+                    self.proxy_port,
+                    socket,
+                ));
             }
         }
-    }
-
-    fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-        let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(10))
-            .with_retries(3)
-            .with_interval(Duration::from_secs(10));
-
-        socket.set_tcp_keepalive(&keepalive)?;
-
-        // setting TCP_USER_TIMEOUT  as TCP_KEEPIDLE + TCP_KEEPINTVL * TCP_KEEPCNT
-        // Using this blog as reference : https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die
-        socket.set_tcp_user_timeout(Some(Duration::from_secs(40)))?;
-        socket.set_nonblocking(true)?;
-        socket.bind(&socket_addr.into())?;
-        socket.listen(128)?;
-
-        Ok(socket)
     }
 
     async fn handle_connection<T>(
         upstream: T,
         flag: Vec<u8>,
-        no_conn: Arc<AtomicU64>,
+        no_conn: ActiveConn,
         proxy_host: String,
         proxy_port: u16,
         socket: SocketAddr,
@@ -266,7 +326,7 @@ impl Proxy {
                     );
 
                     // Increment the no of connection.
-                    no_conn.fetch_add(1, Ordering::SeqCst);
+                    no_conn.inc();
 
                     // Set timeout for the stream.
                     let mut upstream = tokio_io_timeout::TimeoutStream::new(upstream);
@@ -277,7 +337,6 @@ impl Proxy {
 
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
                         Ok((_to_egress, _to_ingress)) => {
-
                             // info!(
                             //     "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
                             // );
@@ -297,7 +356,7 @@ impl Proxy {
                         .map_err(|err| warn!("Unable to flush proxy of socket: {socket} {err}"));
 
                     // Decrement the no of connections.
-                    no_conn.fetch_sub(1, Ordering::SeqCst);
+                    no_conn.dec();
                     break;
                 }
                 Err(_) => {
@@ -312,6 +371,31 @@ impl Proxy {
         );
     }
 }
+#[derive(Clone)]
+struct ActiveConn(Arc<AtomicU64>);
+
+impl ActiveConn {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    // Increments the number of active connections.
+    // Should be called when a proxy connection is started.
+    fn inc(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // Decrementes the number of active connections.
+    // Should be called when proxying of a connection is completed.
+    fn dec(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    // Returns the number of active connections.
+    fn load(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 // This handles the trackking of connection
 // and stops the container after a period of idle
@@ -322,7 +406,7 @@ struct ConnTrack {
     interval: Duration,
 
     // tracks the number of active connection.
-    no_conn: Arc<AtomicU64>,
+    no_conn: ActiveConn,
 
     // determines the idle time after which the connection
     // closed
@@ -337,7 +421,7 @@ struct ConnTrack {
 
 impl ConnTrack {
     fn new(timeout: Duration, docker_man: Sender<docker::Msg>, container_id: ContainerId) -> Self {
-        let no_conn = Arc::new(AtomicU64::default());
+        let no_conn = ActiveConn::new();
         let interval = Duration::from_secs(5);
         Self {
             no_conn,
@@ -348,7 +432,7 @@ impl ConnTrack {
         }
     }
 
-    fn no_conn(&self) -> Arc<AtomicU64> {
+    fn no_conn(&self) -> ActiveConn {
         self.no_conn.clone()
     }
 
@@ -356,7 +440,7 @@ impl ConnTrack {
         let mut last_activity = Instant::now();
 
         loop {
-            let no_conn = self.no_conn.load(Ordering::SeqCst);
+            let no_conn = self.no_conn.load();
 
             if no_conn != 0 {
                 info!("Total No of connection active : {}", no_conn);
@@ -374,8 +458,8 @@ impl ConnTrack {
                         .map_err(|err| error!("Unable to send message to DockerMan: {}", err));
 
                     // Only send the next message after an entire idle period.
-                    // The container takes some time to shutdown properly. This is to make sure we don't
-                    // send multiple stop signals within that time.
+                    // The container takes some time to shutdown properly. This is to make sure
+                    // we don't send multiple stop signals within that time.
                     last_activity = Instant::now();
                 }
             }
