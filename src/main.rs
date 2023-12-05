@@ -41,6 +41,10 @@ struct ConnManArg {
     #[argh(option, short = 'i')]
     image: String,
 
+    /// host address for deployment
+    #[argh(option, short = 'h')]
+    host: String,
+
     /// port exposed by the image
     #[argh(option, short = 'p')]
     service_port: u16,
@@ -130,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     let channel = oneshot::channel();
     let msg = if tls_enabled {
         let tls_proxy = TlsProxy {
-            host: String::from(""),
+            host: arg.host,
             image: image_id,
             env,
         };
