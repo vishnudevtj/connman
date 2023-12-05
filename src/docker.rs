@@ -87,6 +87,12 @@ pub struct ContainerId(pub String);
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ImageId(String);
 
+impl ImageId {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Internal(bollard::errors::Error),
@@ -100,8 +106,6 @@ pub struct DockerMan {
     docker: Docker,
     // Host address of docker backend.
     host: String,
-    // Port for connecting to docker backend.
-    port: u16,
     // Tracks the running status of the container.
     status: HashMap<ContainerId, bool>,
     // Registry containing details of all the images
@@ -121,7 +125,6 @@ impl DockerMan {
 
         Ok(Self {
             host,
-            port,
             docker,
             status,
             registry,
@@ -131,10 +134,6 @@ impl DockerMan {
 
     pub fn host(&self) -> String {
         self.host.clone()
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     pub fn sender(&self) -> Sender<Msg> {

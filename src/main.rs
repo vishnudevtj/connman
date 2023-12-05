@@ -7,19 +7,21 @@ use std::{
 use anyhow::anyhow;
 use argh::FromArgs;
 
-use connman::{docker::Env, ConnmanBuilder, TcpPorxy, TlsProxy};
+mod connman;
+mod docker;
+mod proxy;
+
+use connman::{ConnmanBuilder, TcpPorxy, TlsProxy};
+use docker::Env;
+
 use fern::Dispatch;
-use log::{error, info, LevelFilter};
+use log::{info, LevelFilter};
 
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
-use connman::docker::ImageOption;
+use docker::ImageOption;
 
-mod docker;
-mod proxy;
-
-const PROXY_PORT: u16 = 4243;
 const DEFAULT_LISTEN_PORT: u16 = 4242;
 
 #[derive(FromArgs)]
@@ -85,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut connman = ConnmanBuilder::new();
-    let msg = if let (Some(c), Some(k)) = (arg.cert, arg.key) {
+    let _msg = if let (Some(c), Some(k)) = (arg.cert, arg.key) {
         info!("Loading Certificate and Private Key");
         info!("Overriding Listen port to : 443");
         listen_port = 443;

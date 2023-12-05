@@ -1,25 +1,33 @@
-pub mod docker;
-pub mod proxy;
+use crate::docker::Env;
+use crate::docker::ImageOption;
 
-use docker::ContainerId;
-use docker::CreateOption;
-use docker::{DockerMan, Env, ImageId, ImageOption};
+use crate::docker::ContainerId;
+use crate::docker::CreateOption;
+use crate::docker::{DockerMan, ImageId};
 
-use proxy::Proxy;
-use proxy::{TcpListener, TlsListener};
+use crate::docker;
+use crate::proxy::Proxy;
+use crate::proxy::TlsMsg;
+use crate::proxy::{TcpListener, TlsListener};
+
+use highway::HighwayHasher;
+use highway::Key;
+use log::error;
 
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use rand::distributions::Alphanumeric;
+
 use rand::rngs::StdRng;
-use rand::Rng;
+
 use rand::SeedableRng;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
 use tokio_rustls::rustls::{Certificate, PrivateKey};
+
+pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
 
 pub struct TlsProxy {
     // SNI address for proxying.
@@ -81,7 +89,13 @@ impl ConnmanBuilder {
         let tls = self.tls.map(|x| {
             let listener = TlsListener::new(443, x.0, x.1);
             let map = listener.sender();
-            tokio::spawn(listener.run());
+            let fut = async {
+                listener
+                    .run()
+                    .await
+                    .map_err(|err| error!("Unable to start TLSListener: {err}"))
+            };
+            tokio::spawn(fut);
             map
         });
 
@@ -91,11 +105,9 @@ impl ConnmanBuilder {
             .map(|docker| {
                 let sender = docker.sender();
                 let host = docker.host();
-                let port = docker.port();
                 let port_range = PortRange::new(10_000, 11_000);
                 let back_end = DockerBackEnd {
                     host,
-                    port,
                     sender,
                     port_range,
                 };
@@ -111,7 +123,7 @@ impl ConnmanBuilder {
 
 pub struct Connman {
     // Channel to communicate with TLSListener.
-    tls: Option<Sender<proxy::TlsMsg>>,
+    tls: Option<Sender<TlsMsg>>,
 
     // List of all available docker backend.
     docker: Vec<DockerBackEnd>,
@@ -152,12 +164,20 @@ impl Connman {
             .aquire_port()
             .ok_or(anyhow!("No port left on docker host"))?;
 
-        let rng = {
+        let _rng = {
             let rng = rand::thread_rng();
             StdRng::from_rng(rng)?
         };
-        let name: Vec<u8> = rng.sample_iter(&Alphanumeric).take(10).collect();
-        let name = String::from_utf8(name)?;
+        use highway::HighwayHash;
+        let hash_key = Key(HASH_KEY);
+        let mut hasher = HighwayHasher::new(hash_key);
+        hasher.append(tcp_option.image.as_bytes());
+        hasher.append(&tcp_option.listen_port.to_le_bytes());
+        if let Some(env) = tcp_option.env.as_ref() {
+            hasher.append(env.key.as_bytes());
+            hasher.append(env.value.as_bytes());
+        };
+        let name = hasher.finalize64().to_string();
 
         let create_option = CreateOption {
             image_id: tcp_option.image,
@@ -178,7 +198,13 @@ impl Connman {
 
         let listen_port = tcp_option.listen_port;
         let listener = TcpListener::new(listen_port, proxy);
-        tokio::spawn(listener.run());
+        let fut = async {
+            listener
+                .run()
+                .await
+                .map_err(|err| error!("Unable to start TcpListener: {err}"))
+        };
+        tokio::spawn(fut);
 
         let host = format!("0.0.0.0:{}", listen_port);
         Ok(host)
@@ -194,12 +220,17 @@ impl Connman {
         match &self.tls {
             Some(sender) => {
                 let docker = self.get_docker_man();
-                let rng = {
-                    let rng = rand::thread_rng();
-                    StdRng::from_rng(rng)?
+
+                use highway::HighwayHash;
+                let hash_key = Key(HASH_KEY);
+                let mut hasher = HighwayHasher::new(hash_key);
+                hasher.append(tls_option.image.as_bytes());
+                hasher.append(tls_option.host.as_bytes());
+                if let Some(env) = tls_option.env.as_ref() {
+                    hasher.append(env.key.as_bytes());
+                    hasher.append(env.value.as_bytes());
                 };
-                let name: Vec<u8> = rng.sample_iter(&Alphanumeric).take(10).collect();
-                let name = String::from_utf8(name)?;
+                let name = hasher.finalize64().to_string();
 
                 let create_option = CreateOption {
                     image_id: tls_option.image,
@@ -219,7 +250,7 @@ impl Connman {
                 );
 
                 sender
-                    .send(proxy::TlsMsg::Add(tls_option.host.clone(), proxy))
+                    .send(TlsMsg::Add(tls_option.host.clone(), proxy))
                     .await?;
                 let host = format!("{}", tls_option.host);
                 Ok(host)
@@ -242,7 +273,7 @@ impl Connman {
 
 struct PortRange {
     start: u16,
-    end: u16,
+    _end: u16,
     used: Vec<bool>,
 }
 
@@ -250,7 +281,11 @@ impl PortRange {
     fn new(start: u16, end: u16) -> Self {
         assert!(end > start);
         let used = vec![false; (end - start) as usize];
-        Self { start, end, used }
+        Self {
+            start,
+            _end: end,
+            used,
+        }
     }
     fn aquire_port(&mut self) -> Option<u16> {
         for (idx, used) in self.used.iter_mut().enumerate() {
@@ -261,8 +296,8 @@ impl PortRange {
         }
         None
     }
-    fn release_port(&mut self, port: u16) {
-        assert!(port < self.end);
+    fn _release_port(&mut self, port: u16) {
+        assert!(port < self._end);
         let id = port - self.start;
         self.used[id as usize] = false;
     }
@@ -271,7 +306,6 @@ impl PortRange {
 // Structure which contains details about a specific docker backend.
 struct DockerBackEnd {
     host: String,
-    port: u16,
     sender: Sender<docker::Msg>,
     port_range: PortRange,
 }

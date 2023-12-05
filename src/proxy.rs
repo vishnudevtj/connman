@@ -9,8 +9,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context};
-use highway::{HighwayHash, HighwayHasher, Key};
+use anyhow::Context;
+
 use log::{error, info, warn};
 use pin_project::pin_project;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -18,10 +18,7 @@ use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex,
-    },
+    sync::mpsc::{self, Receiver, Sender},
     time::{sleep, Instant},
 };
 use tokio_rustls::{
@@ -115,7 +112,13 @@ impl TlsListener {
         Ok(())
     }
 
-    fn handle_tls_msg(&mut self, msg: TlsMsg) {}
+    fn handle_tls_msg(&mut self, msg: TlsMsg) {
+        match msg {
+            TlsMsg::Add(host, proxy) => {
+                self.map.insert(host, Arc::new(proxy));
+            }
+        }
+    }
     async fn handle_connection(
         &self,
         acceptor: &TlsAcceptor,
@@ -164,7 +167,7 @@ impl TcpListener {
 
     pub async fn run(self) -> anyhow::Result<()> {
         info!("Starting TCPListener");
-        info!("\tListen Port:\t\t{}", self.listen_port);
+        info!("\tListen Port:\t{}", self.listen_port);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
