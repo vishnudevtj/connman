@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 use docker::ImageOption;
+use webpki::EndEntityCert;
 
 const DEFAULT_LISTEN_PORT: u16 = 4242;
 
@@ -93,6 +94,14 @@ async fn main() -> anyhow::Result<()> {
         listen_port = 443;
         let cert = load_certificates_from_pem(&c)?;
         let key = load_private_key_from_file(&k)?;
+        for c in cert.iter() {
+            let cert_der = c.as_ref();
+            let cert = EndEntityCert::try_from(cert_der)?;
+            for dns_name in cert.dns_names()? {
+                let name: &str = dns_name.into();
+                info!("Got Certificate for DNS: {}", name);
+            }
+        }
         connman = connman.with_tls(cert, key);
         tls_enabled = true;
     };
