@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         connman::Msg::TlsProxy(tls_proxy, channel.0)
     } else {
         let tcp_proxy = TcpPorxy {
+            host: arg.host,
             listen_port,
             image: image_id,
             env,

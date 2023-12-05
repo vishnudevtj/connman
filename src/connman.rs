@@ -39,6 +39,8 @@ pub struct TlsProxy {
 }
 
 pub struct TcpPorxy {
+    // host address
+    pub host: String,
     // Port on proxy host to listen.
     pub listen_port: u16,
     // Id of the image to deploy for proxying.
@@ -206,7 +208,7 @@ impl Connman {
         };
         tokio::spawn(fut);
 
-        let host = format!("0.0.0.0:{}", listen_port);
+        let host = format!("{}:{}", tcp_option.host, listen_port);
         Ok(host)
     }
 
