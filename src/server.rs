@@ -51,12 +51,7 @@ impl ConnMan for ImplConnMan {
                 };
                 Response::new(resp)
             })
-            .map(|id| {
-                let proxy = Proxy {
-                    proxy_id: id,
-                    host: "".to_string(),
-                    port: 0.to_string(),
-                };
+            .map(|proxy| {
                 let response = AddProxyResponse {
                     ok: true,
                     response: Some(add_proxy_response::Response::Proxy(proxy)),
@@ -91,7 +86,7 @@ pub async fn start_grpc(addr: SocketAddr, docker: Sender<connman::Msg>) -> anyho
 async fn _add_proxy(
     connman: &Sender<connman::Msg>,
     request: AddProxyRequest,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<Proxy> {
     // Register the image.
     let image_option = ImageOption {
         always_pull: true,
@@ -118,7 +113,11 @@ async fn _add_proxy(
     let msg = connman::Msg::TcpPorxy(tcp_proxy, channel.0);
     connman.send(msg).await?;
     let url = channel.1.await??;
-    info!("Url: {}", url);
 
-    Ok(1)
+    Ok(Proxy {
+        // TODO: implement logic for id.
+        proxy_id: 0,
+        host: url.host,
+        port: url.port.to_string(),
+    })
 }

@@ -29,6 +29,8 @@ use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
 
+const TLS_PORT: u16 = 443;
+
 pub struct TlsProxy {
     // SNI address for proxying.
     pub host: String,
@@ -49,11 +51,20 @@ pub struct TcpPorxy {
     pub env: Option<Env>,
 }
 
+// Represent the Url on which the proxy is active.
+pub struct Url {
+    // host address of the proxy
+    pub host: String,
+    // port on which we listen for connection for a
+    // specific proxy
+    pub port: u16,
+}
+
 pub enum Msg {
     // Deploys a challenge and returns the URL to access it.
-    TlsProxy(TlsProxy, oneshot::Sender<Result<String>>),
+    TlsProxy(TlsProxy, oneshot::Sender<Result<Url>>),
     // Deploys a TCP challenge and retuns host:port.
-    TcpPorxy(TcpPorxy, oneshot::Sender<Result<String>>),
+    TcpPorxy(TcpPorxy, oneshot::Sender<Result<Url>>),
     // Register a container image on all available docker backend.
     RegisterImage(ImageOption, oneshot::Sender<Result<ImageId>>),
 }
@@ -89,7 +100,7 @@ impl ConnmanBuilder {
             return Err(anyhow!("No Docker backend configured!"));
         }
         let tls = self.tls.map(|x| {
-            let listener = TlsListener::new(443, x.0, x.1);
+            let listener = TlsListener::new(TLS_PORT, x.0, x.1);
             let map = listener.sender();
             let fut = async {
                 listener
@@ -158,7 +169,7 @@ impl Connman {
         self.conn.0.clone()
     }
 
-    async fn handle_tcp_proxy(&mut self, tcp_option: TcpPorxy) -> Result<String> {
+    async fn handle_tcp_proxy(&mut self, tcp_option: TcpPorxy) -> Result<Url> {
         let docker = self.get_docker_man_mut();
         let proxy_host = docker.host.clone();
         let proxy_port = docker
@@ -208,11 +219,14 @@ impl Connman {
         };
         tokio::spawn(fut);
 
-        let host = format!("{}:{}", tcp_option.host, listen_port);
-        Ok(host)
+        let url = Url {
+            host: tcp_option.host.clone(),
+            port: listen_port,
+        };
+        Ok(url)
     }
 
-    async fn handle_tls_proxy(&mut self, tls_option: TlsProxy) -> Result<String> {
+    async fn handle_tls_proxy(&mut self, tls_option: TlsProxy) -> Result<Url> {
         let docker = self.get_docker_man_mut();
         let port = docker
             .port_range
@@ -254,8 +268,11 @@ impl Connman {
                 sender
                     .send(TlsMsg::Add(tls_option.host.clone(), proxy))
                     .await?;
-                let host = format!("{}", tls_option.host);
-                Ok(host)
+                let url = Url {
+                    host: tls_option.host.clone(),
+                    port: TLS_PORT,
+                };
+                Ok(url)
             }
             None => Err(anyhow!("TLS Listener not configured")),
         }

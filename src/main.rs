@@ -212,7 +212,7 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
     };
     sender.send(msg).await?;
     let url = channel.1.await??;
-    info!("Url: {}", url);
+    info!("Url: {}:{}", url.host, url.port);
 
     // Wait indefinetly
     let channel = oneshot::channel::<bool>();

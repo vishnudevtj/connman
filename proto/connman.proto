@@ -39,8 +39,8 @@ message AddProxyRequest {
     ChallengeType type = 1;
     string image   = 2;
     int32  port    = 3;
-    string env_key = 5;
-    string env_value = 6;
+    optional string env_key = 5;
+    optional string env_value = 6;
 }
 
 message Proxy {
