@@ -290,14 +290,14 @@ impl Connman {
     }
 }
 
-struct PortRange {
+pub struct PortRange {
     start: u16,
     _end: u16,
     used: Vec<bool>,
 }
 
 impl PortRange {
-    fn new(start: u16, end: u16) -> Self {
+    pub fn new(start: u16, end: u16) -> Self {
         assert!(end > start);
         let used = vec![false; (end - start) as usize];
         Self {
@@ -306,7 +306,7 @@ impl PortRange {
             used,
         }
     }
-    fn aquire_port(&mut self) -> Option<u16> {
+    pub fn aquire_port(&mut self) -> Option<u16> {
         for (idx, used) in self.used.iter_mut().enumerate() {
             if *used != true {
                 *used = true;
@@ -315,7 +315,7 @@ impl PortRange {
         }
         None
     }
-    fn _release_port(&mut self, port: u16) {
+    pub fn _release_port(&mut self, port: u16) {
         assert!(port < self._end);
         let id = port - self.start;
         self.used[id as usize] = false;

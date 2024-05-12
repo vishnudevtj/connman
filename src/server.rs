@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use log::info;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 use tonic::{transport::Server, Request, Response, Status};
 
 pub mod grpc {
@@ -15,16 +15,18 @@ use grpc::{
     AddTlsListenerResponse, ChallengeType, Proxy, RemoveProxyRequest, RemoveProxyResponse,
 };
 
-use crate::connman::{self, TcpPorxy};
-use crate::docker::ImageOption;
+use crate::connman::{self, PortRange, TcpPorxy};
+use crate::docker::{Env, ImageOption};
 
 pub struct ImplConnMan {
+    host_port: Mutex<PortRange>,
     connman: Sender<connman::Msg>,
 }
 
 impl ImplConnMan {
     pub fn new(connman: Sender<connman::Msg>) -> Self {
-        Self { connman }
+        let host_port = Mutex::new(PortRange::new(20_000, 30_000));
+        Self { connman, host_port }
     }
 }
 
@@ -42,7 +44,10 @@ impl ConnMan for ImplConnMan {
         request: Request<AddProxyRequest>,
     ) -> Result<Response<AddProxyResponse>, Status> {
         let request: AddProxyRequest = request.into_inner();
-        let res = _add_proxy(&self.connman, request)
+        // TODO: unwrap
+        let host_port = { self.host_port.lock().await.aquire_port().unwrap() };
+
+        let res = _add_proxy(&self.connman, host_port, request)
             .await
             .map_err(|err| {
                 let resp = AddProxyResponse {
@@ -85,6 +90,7 @@ pub async fn start_grpc(addr: SocketAddr, docker: Sender<connman::Msg>) -> anyho
 
 async fn _add_proxy(
     connman: &Sender<connman::Msg>,
+    host_port: u16,
     request: AddProxyRequest,
 ) -> anyhow::Result<Proxy> {
     // Register the image.
@@ -102,12 +108,18 @@ async fn _add_proxy(
 
     let image_id = channel.1.await??;
 
+    let env = if let (Some(key), Some(value)) = (request.env_key, request.env_value) {
+        Some(Env { key, value })
+    } else {
+        None
+    };
+
     let channel = oneshot::channel();
     let tcp_proxy = TcpPorxy {
         host: "0.0.0.0".to_string(),
-        listen_port: 7777,
+        listen_port: host_port,
         image: image_id,
-        env: None,
+        env,
     };
 
     let msg = connman::Msg::TcpPorxy(tcp_proxy, channel.0);
