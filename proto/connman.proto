@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package connman;
+
+service ConnMan {
+    // Add a TLS Listener. It is possible to host multiple web challenges on a TLS listener.
+    // If the provided TLS certificate wildcard certificate.
+    rpc AddTLSListener(AddTLSListenerRequest) returns (AddTLSListenerResponse) {}
+
+    // Add a new proxy which forward connection to a container.
+    rpc AddProxy(AddProxyRequest) returns (AddProxyResponse) {}
+    // Remove previously added proxy.
+    rpc RemoveProxy(RemoveProxyRequest) returns (RemoveProxyResponse) {}
+}
+
+message AddTLSListenerRequest {
+    int32 port  = 1;
+    string cert_file = 2;
+    string key_file  = 3;
+}
+
+message AddTLSListenerResponse {
+    bool ok = 1;
+    oneof response {
+        uint64 id = 2;
+        string error = 3;
+    }
+}
+
+// If an TLS listener with wild card certificate is available. 
+// The web challenge will be hosted on it.
+enum ChallengeType {
+    PWN = 0;
+    WEB = 1;
+}
+
+// TODO: Requires challenge resource allocation metrics.
+message AddProxyRequest {
+    ChallengeType type = 1;
+    string image   = 2;
+    int32  port    = 3;
+    string env_key = 5;
+    string env_value = 6;
+}
+
+message Proxy {
+    uint64 proxy_id = 1;
+    string host  = 2;
+    string port  = 3;
+
+}
+
+message AddProxyResponse {
+    bool ok = 1;
+    oneof response {
+        Proxy proxy  = 2;
+        string error = 3;
+    }
+}
+
+message RemoveProxyRequest {
+    uint64 id = 1;
+}
+
+message RemoveProxyResponse {
+    bool ok = 1;
+    oneof response {
+        uint64 id    = 2;
+        string error = 3;
+    }
+}

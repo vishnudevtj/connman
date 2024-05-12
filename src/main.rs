@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::BufReader,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -10,6 +11,7 @@ use argh::FromArgs;
 mod connman;
 mod docker;
 mod proxy;
+mod server;
 
 use connman::{ConnmanBuilder, TcpPorxy, TlsProxy};
 use docker::Env;
@@ -17,15 +19,54 @@ use docker::Env;
 use fern::Dispatch;
 use log::{info, LevelFilter};
 
+use socket2::Socket;
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 use docker::ImageOption;
+use tonic::transport::Server;
 use webpki::EndEntityCert;
+
+#[derive(FromArgs, PartialEq, Debug)]
+/// Top-level command.
+struct TopLevel {
+    #[argh(subcommand)]
+    nested: Args,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand)]
+enum Args {
+    GrpcArg(GrpcArg),
+    ConnManArg(ConnManArg),
+}
 
 const DEFAULT_LISTEN_PORT: u16 = 4242;
 
-#[derive(FromArgs)]
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "grpc")]
+/// Starts a gRPC server for configuring the service.
+struct GrpcArg {
+    /// host address for starting gRPC server
+    #[argh(option, short = 'h', default = "String::from(\"0.0.0.0\")")]
+    host: String,
+
+    /// host port on which to start gRPC server
+    #[argh(option, short = 'p', default = "50051")]
+    port: u16,
+
+    /// address of docker HTTP API server   
+    #[argh(option)]
+    docker_host: String,
+
+    /// port on which docker HTTP API server
+    /// listens
+    #[argh(option)]
+    docker_port: u16,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "cli")]
 /// Auto start docker container on TCP request.
 struct ConnManArg {
     /// address of docker HTTP API server   
@@ -81,8 +122,29 @@ struct ConnManArg {
 async fn main() -> anyhow::Result<()> {
     setup_logger()?;
 
+    let arg: TopLevel = argh::from_env();
+    let res = match arg.nested {
+        Args::GrpcArg(arg) => start_grpc(arg).await,
+        Args::ConnManArg(arg) => start_cli(arg).await,
+    };
+    return res;
+}
+
+async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
+    let connman = ConnmanBuilder::new();
+    // Add docker backend.
+    let connman = connman.with_docker(arg.docker_host, arg.docker_port)?;
+    let connman = connman.build()?;
+    let sender = connman.sender();
+
+    tokio::spawn(connman.run());
+
+    let addr = format!("{}:{}", arg.host, arg.port).parse()?;
+    server::start_grpc(addr, sender).await
+}
+
+async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
     let mut tls_enabled = false;
-    let arg: ConnManArg = argh::from_env();
     let mut listen_port = arg.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
 
     let env = if let (Some(key), Some(value)) = (arg.env_key, arg.env_value) {

@@ -77,8 +77,7 @@ impl TlsListener {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
-        info!("Starting TLSListener!");
-        info!("\tListen Port:\t\t{}", self.listen_port);
+        info!("Starting TLSListener on Port:\t\t{}", self.listen_port);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
@@ -167,8 +166,7 @@ impl TcpListener {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        info!("Starting TCPListener");
-        info!("\tListen Port:\t{}", self.listen_port);
+        info!("Starting TCPListener on Port:\t{}", self.listen_port);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
@@ -227,7 +225,7 @@ pub struct Proxy {
     // Address on which the container starts
     proxy_host: String,
 
-    // Environment variable contain flag
+    // Environment variables for the container.
     env: Option<Env>,
 
     // Sender to communicate with DockerMan to start
@@ -419,7 +417,7 @@ struct ConnTrack {
     // channel to dockerman
     docker_man: Sender<docker::Msg>,
 
-    // if of the container that is being tracked
+    // id of the container that is being tracked
     container_id: ContainerId,
 }
 
