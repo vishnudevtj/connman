@@ -7,6 +7,9 @@ service ConnMan {
     // If the provided TLS certificate wildcard certificate.
     rpc AddTLSListener(AddTLSListenerRequest) returns (AddTLSListenerResponse) {}
 
+    // Registers a image and returns an Id. This allows us to pull images ahead of time.
+    rpc RegisterImage(RegisterImageRequest) returns (RegisterImageResponse) {}
+
     // Add a new proxy which forward connection to a container.
     rpc AddProxy(AddProxyRequest) returns (AddProxyResponse) {}
     // Remove previously added proxy.
@@ -34,13 +37,28 @@ enum ChallengeType {
     WEB = 1;
 }
 
+// TODO: Pass on registry credentials
+message RegisterImageRequest {
+    ChallengeType type = 1;
+    string image = 2;
+    string tag = 3;
+    // Port which the image exposes
+    int32  port    = 4;
+}
+
+message RegisterImageResponse {
+    bool ok = 1;
+    oneof response {
+        uint64 id = 2;
+        string error = 3;
+    }
+}
+
 // TODO: Requires challenge resource allocation metrics.
 message AddProxyRequest {
-    ChallengeType type = 1;
-    string image   = 2;
-    int32  port    = 3;
-    optional string env_key = 5;
-    optional string env_value = 6;
+    uint64 id = 1;
+    optional string env_key = 2;
+    optional string env_value = 3;
 }
 
 message Proxy {

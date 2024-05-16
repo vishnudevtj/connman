@@ -85,11 +85,17 @@ pub struct ContainerId(pub String);
 
 // Represend an Id for a docker container
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
-pub struct ImageId(String);
+pub struct ImageId(u64);
 
 impl ImageId {
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+    pub fn into_inner(&self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ImageId {
+    fn from(id: u64) -> Self {
+        ImageId(id)
     }
 }
 
@@ -150,6 +156,7 @@ impl DockerMan {
                         let image_option = image_option.clone();
 
                         let future = async move {
+                            let image_option = image_option.clone();
                             let result = DockerMan::check_and_create_container(
                                 docker,
                                 option,
@@ -464,6 +471,6 @@ impl From<&ImageOption> for ImageId {
         hasher.append(value.name.as_bytes());
         hasher.append(value.tag.as_bytes());
         hasher.append(&value.service_port.to_le_bytes());
-        ImageId(hasher.finalize64().to_string())
+        ImageId(hasher.finalize64())
     }
 }

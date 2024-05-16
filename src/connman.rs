@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::docker::Env;
 use crate::docker::ImageOption;
 
@@ -21,6 +23,7 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 
 use rand::SeedableRng;
+use tokio::sync::Mutex;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
@@ -118,7 +121,7 @@ impl ConnmanBuilder {
             .map(|docker| {
                 let sender = docker.sender();
                 let host = docker.host();
-                let port_range = PortRange::new(10_000, 11_000);
+                let port_range = PortRange::new(30_000, 60_000);
                 let back_end = DockerBackEnd {
                     host,
                     sender,
@@ -130,7 +133,12 @@ impl ConnmanBuilder {
             .collect();
 
         let conn = tokio::sync::mpsc::channel(10);
-        Ok(Connman { tls, docker, conn })
+        Ok(Connman {
+            tls,
+            docker,
+            sender: conn.0,
+            receiver: Some(conn.1),
+        })
     }
 }
 
@@ -141,40 +149,56 @@ pub struct Connman {
     // List of all available docker backend.
     docker: Vec<DockerBackEnd>,
 
-    conn: (Sender<Msg>, Receiver<Msg>),
+    sender: Sender<Msg>,
+    receiver: Option<Receiver<Msg>>,
 }
 
 impl Connman {
-    pub async fn run(mut self) {
-        while let Some(msg) = self.conn.1.recv().await {
-            match msg {
-                Msg::RegisterImage(image_option, result) => {
-                    let docker = self.get_docker_man();
-                    let r = docker.register_image(image_option).await;
-                    let _ = result.send(r);
-                }
-                Msg::TlsProxy(tls_option, result) => {
-                    let r = self.handle_tls_proxy(tls_option).await;
-                    let _ = result.send(r);
-                }
-                Msg::TcpPorxy(tcp_option, result) => {
-                    let r = self.handle_tcp_proxy(tcp_option).await;
-                    let _ = result.send(r);
-                }
+    pub async fn run(self, mut receiver: Receiver<Msg>) {
+        let connman = Arc::new(self);
+        while let Some(msg) = receiver.recv().await {
+            let connman = connman.clone();
+            let future = async move {
+                connman.handle_message(msg).await;
+            };
+            tokio::spawn(future);
+        }
+    }
+
+    async fn handle_message(&self, msg: Msg) {
+        match msg {
+            Msg::RegisterImage(image_option, result) => {
+                let docker = self.get_docker_man();
+                let r = docker.register_image(image_option).await;
+                let _ = result.send(r);
+            }
+            Msg::TlsProxy(tls_option, result) => {
+                let r = self.handle_tls_proxy(tls_option).await;
+                let _ = result.send(r);
+            }
+            Msg::TcpPorxy(tcp_option, result) => {
+                let r = self.handle_tcp_proxy(tcp_option).await;
+                let _ = result.send(r);
             }
         }
     }
 
     pub fn sender(&self) -> Sender<Msg> {
-        self.conn.0.clone()
+        self.sender.clone()
     }
 
-    async fn handle_tcp_proxy(&mut self, tcp_option: TcpPorxy) -> Result<Url> {
-        let docker = self.get_docker_man_mut();
+    pub fn receiver(&mut self) -> Option<Receiver<Msg>> {
+        self.receiver.take()
+    }
+
+    async fn handle_tcp_proxy(&self, tcp_option: TcpPorxy) -> Result<Url> {
+        let docker = self.get_docker_man();
         let proxy_host = docker.host.clone();
-        let proxy_port = docker
+
+        let docker_port = docker
             .port_range
             .aquire_port()
+            .await
             .ok_or(anyhow!("No port left on docker host"))?;
 
         let _rng = {
@@ -184,7 +208,7 @@ impl Connman {
         use highway::HighwayHash;
         let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
-        hasher.append(tcp_option.image.as_bytes());
+        hasher.append(&tcp_option.image.into_inner().to_le_bytes());
         hasher.append(&tcp_option.listen_port.to_le_bytes());
         if let Some(env) = tcp_option.env.as_ref() {
             hasher.append(env.key.as_bytes());
@@ -196,11 +220,11 @@ impl Connman {
             image_id: tcp_option.image,
             container_name: name,
             env: tcp_option.env.clone(),
-            port: proxy_port,
+            port: docker_port,
         };
 
         let container_id = docker.create_container(create_option).await?;
-
+        let proxy_port = tcp_option.listen_port;
         let proxy = Proxy::new(
             container_id,
             proxy_port,
@@ -209,8 +233,7 @@ impl Connman {
             docker.sender(),
         );
 
-        let listen_port = tcp_option.listen_port;
-        let listener = TcpListener::new(listen_port, proxy);
+        let listener = TcpListener::new(proxy_port, proxy);
         let fut = async {
             listener
                 .run()
@@ -221,16 +244,17 @@ impl Connman {
 
         let url = Url {
             host: tcp_option.host.clone(),
-            port: listen_port,
+            port: proxy_port,
         };
         Ok(url)
     }
 
-    async fn handle_tls_proxy(&mut self, tls_option: TlsProxy) -> Result<Url> {
-        let docker = self.get_docker_man_mut();
+    async fn handle_tls_proxy(&self, tls_option: TlsProxy) -> Result<Url> {
+        let docker = self.get_docker_man();
         let port = docker
             .port_range
             .aquire_port()
+            .await
             .ok_or(anyhow!("No port left on docker host"))?;
 
         match &self.tls {
@@ -240,7 +264,7 @@ impl Connman {
                 use highway::HighwayHash;
                 let hash_key = Key(HASH_KEY);
                 let mut hasher = HighwayHasher::new(hash_key);
-                hasher.append(tls_option.image.as_bytes());
+                hasher.append(&tls_option.image.into_inner().to_le_bytes());
                 hasher.append(tls_option.host.as_bytes());
                 if let Some(env) = tls_option.env.as_ref() {
                     hasher.append(env.key.as_bytes());
@@ -282,15 +306,14 @@ impl Connman {
         let rand: usize = rand::random();
         &self.docker[rand % self.docker.len()]
     }
-
-    fn get_docker_man_mut(&mut self) -> &mut DockerBackEnd {
-        let len = self.docker.len();
-        let rand: usize = rand::random();
-        &mut self.docker[rand % len]
-    }
 }
 
+#[derive(Clone)]
 pub struct PortRange {
+    inner: Arc<Mutex<PortRangeInner>>,
+}
+
+pub struct PortRangeInner {
     start: u16,
     _end: u16,
     used: Vec<bool>,
@@ -300,29 +323,39 @@ impl PortRange {
     pub fn new(start: u16, end: u16) -> Self {
         assert!(end > start);
         let used = vec![false; (end - start) as usize];
-        Self {
+        let inner = PortRangeInner {
             start,
             _end: end,
             used,
-        }
+        };
+        let inner = Arc::new(Mutex::new(inner));
+        Self { inner }
     }
-    pub fn aquire_port(&mut self) -> Option<u16> {
-        for (idx, used) in self.used.iter_mut().enumerate() {
+    pub async fn aquire_port(&self) -> Option<u16> {
+        let mut inner = self.inner.lock().await;
+        for (idx, used) in inner.used.iter_mut().enumerate() {
             if *used != true {
                 *used = true;
-                return Some(self.start + idx as u16);
+                return Some(inner.start + idx as u16);
             }
         }
         None
     }
-    pub fn _release_port(&mut self, port: u16) {
-        assert!(port < self._end);
-        let id = port - self.start;
-        self.used[id as usize] = false;
+
+    pub async fn _release_port(&self, port: u16) {
+        let mut inner = self.inner.lock().await;
+        if (port > inner._end) {
+            error!("release_port({}) : Ivalid port given", port);
+            return;
+        }
+
+        let id = port - inner.start;
+        inner.used[id as usize] = false;
     }
 }
 
 // Structure which contains details about a specific docker backend.
+#[derive(Clone)]
 struct DockerBackEnd {
     host: String,
     sender: Sender<docker::Msg>,

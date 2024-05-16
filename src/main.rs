@@ -134,10 +134,11 @@ async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
     let connman = ConnmanBuilder::new();
     // Add docker backend.
     let connman = connman.with_docker(arg.docker_host, arg.docker_port)?;
-    let connman = connman.build()?;
+    let mut connman = connman.build()?;
     let sender = connman.sender();
 
-    tokio::spawn(connman.run());
+    let receiver = connman.receiver().take().unwrap();
+    tokio::spawn(connman.run(receiver));
 
     let addr = format!("{}:{}", arg.host, arg.port).parse()?;
     server::start_grpc(addr, sender).await
@@ -174,9 +175,10 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
 
     // Add docker backend.
     let connman = connman.with_docker(arg.docker_host, arg.docker_port)?;
-    let connman = connman.build()?;
+    let mut connman = connman.build()?;
     let sender = connman.sender();
-    tokio::spawn(connman.run());
+    let receiver = connman.receiver().take().unwrap();
+    tokio::spawn(connman.run(receiver));
 
     info!("Starting connman Server 0.3");
 

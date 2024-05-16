@@ -26,6 +26,7 @@ use tokio_rustls::{
     server::TlsStream,
     TlsAcceptor,
 };
+use tracing::span;
 
 use crate::docker::{self, ContainerId, Env};
 
@@ -166,7 +167,10 @@ impl TcpListener {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        info!("Starting TCPListener on Port:\t{}", self.listen_port);
+        info!(
+            "[{}] Starting TCPListener on Port:\t{}",
+            self.proxy.container_id.0, self.listen_port
+        );
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
@@ -182,7 +186,10 @@ impl TcpListener {
             .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
 
         while let Ok((stream, socket)) = listener.accept().await {
-            info!("Got Connection from: {socket}");
+            info!(
+                "[{}] Got Connection from: {socket}",
+                self.proxy.container_id.0
+            );
             let stream = SuperStream::Tcp(stream);
             let proxy = self.proxy.clone();
             let fut = async move {
@@ -281,6 +288,7 @@ impl Proxy {
             SuperStream::Tcp(s) => {
                 tokio::spawn(Proxy::handle_connection(
                     s,
+                    self.container_id.clone(),
                     flag.clone(),
                     no_conn.clone(),
                     self.proxy_host.clone(),
@@ -291,6 +299,7 @@ impl Proxy {
             SuperStream::Tls(s) => {
                 tokio::spawn(Proxy::handle_connection(
                     s,
+                    self.container_id.clone(),
                     flag.clone(),
                     no_conn.clone(),
                     self.proxy_host.clone(),
@@ -303,6 +312,7 @@ impl Proxy {
 
     async fn handle_connection<T>(
         upstream: T,
+        container_id: ContainerId,
         flag: Vec<u8>,
         no_conn: ActiveConn,
         proxy_host: String,
@@ -322,7 +332,8 @@ impl Proxy {
             match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
                 Ok(proxy_stream) => {
                     info!(
-                        "Proxied Connection after try: {} : {:?}",
+                        "[{}] Proxied Connection after try: {} : {:?}",
+                        container_id.0,
                         MAX_TRIES - no_of_try,
                         instant.elapsed()
                     );
@@ -368,7 +379,8 @@ impl Proxy {
             }
         }
         info!(
-            "Connection closed for: {socket} elapsed time {:?}",
+            "[{}] Connection closed for: {socket} elapsed time {:?}",
+            container_id.0,
             instant.elapsed()
         );
     }
