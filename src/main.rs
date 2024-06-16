@@ -141,7 +141,8 @@ async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
     tokio::spawn(connman.run(receiver));
 
     let addr = format!("{}:{}", arg.host, arg.port).parse()?;
-    server::start_grpc(addr, sender).await
+    let db = String::from("database.sqlite");
+    server::start_grpc(addr, sender, db).await
 }
 
 async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {

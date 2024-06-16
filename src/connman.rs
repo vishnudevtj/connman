@@ -23,6 +23,7 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 
 use rand::SeedableRng;
+use tokio::net::unix::SocketAddr;
 use tokio::sync::Mutex;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -201,10 +202,7 @@ impl Connman {
             .await
             .ok_or(anyhow!("No port left on docker host"))?;
 
-        let _rng = {
-            let rng = rand::thread_rng();
-            StdRng::from_rng(rng)?
-        };
+        // Generate a unique hash for the proxy
         use highway::HighwayHash;
         let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
@@ -331,12 +329,15 @@ impl PortRange {
         let inner = Arc::new(Mutex::new(inner));
         Self { inner }
     }
+
     pub async fn aquire_port(&self) -> Option<u16> {
         let mut inner = self.inner.lock().await;
+        let start = inner.start;
         for (idx, used) in inner.used.iter_mut().enumerate() {
             if *used != true {
+                let port = start + idx as u16;
                 *used = true;
-                return Some(inner.start + idx as u16);
+                return Some(port);
             }
         }
         None
@@ -344,7 +345,7 @@ impl PortRange {
 
     pub async fn _release_port(&self, port: u16) {
         let mut inner = self.inner.lock().await;
-        if (port > inner._end) {
+        if port > inner._end {
             error!("release_port({}) : Ivalid port given", port);
             return;
         }

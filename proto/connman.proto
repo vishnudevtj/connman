@@ -4,7 +4,7 @@ package connman;
 
 service ConnMan {
     // Add a TLS Listener. It is possible to host multiple web challenges on a TLS listener.
-    // If the provided TLS certificate wildcard certificate.
+    // If the provided with a TLS certificate wildcard certificate.
     rpc AddTLSListener(AddTLSListenerRequest) returns (AddTLSListenerResponse) {}
 
     // Registers a image and returns an Id. This allows us to pull images ahead of time.
