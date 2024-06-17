@@ -23,7 +23,7 @@ use tokio::sync::{
     oneshot,
 };
 
-const CONTAINER_NAME_PREFIX: &str = "connman-";
+pub const CONTAINER_NAME_PREFIX: &str = "connman-";
 
 pub enum Msg {
     Register(ImageOption, oneshot::Sender<Result<ImageId, Error>>),
@@ -31,6 +31,7 @@ pub enum Msg {
     Start(ContainerId),
     Stop(ContainerId),
     UpdateStatus(ContainerId, bool),
+    GetImageOption(ImageId, oneshot::Sender<Result<ImageOption, Error>>),
 }
 
 #[derive(Clone)]
@@ -226,6 +227,15 @@ impl DockerMan {
                         .entry(id)
                         .and_modify(|s| *s = status)
                         .or_insert(status);
+                }
+
+                Msg::GetImageOption(image_id, response) => {
+                    if let Some(image_option) = self.registry.get(&image_id) {
+                        let image_option = image_option.clone();
+                        let _ = response.send(Ok(image_option));
+                    } else {
+                        let _ = response.send(Err(Error::ImageNotFound));
+                    }
                 }
             }
         }

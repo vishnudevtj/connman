@@ -12,6 +12,7 @@ mod connman;
 mod docker;
 mod proxy;
 mod server;
+mod tui;
 
 use connman::{ConnmanBuilder, TcpPorxy, TlsProxy};
 use docker::Env;
@@ -120,7 +121,13 @@ struct ConnManArg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    setup_logger()?;
+    // Setup TUI
+
+    tui::tui();
+
+    // Since TUI contains logging we are not enabling stdout logging
+    // Enable this if TUI is turned off.
+    // setup_logger()?;
 
     let arg: TopLevel = argh::from_env();
     let res = match arg.nested {
@@ -146,6 +153,9 @@ async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
 }
 
 async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
+    // Setup TUI
+    let tui = tui::tui();
+
     let mut tls_enabled = false;
     let mut listen_port = arg.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
 
@@ -245,6 +255,7 @@ fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKey> {
     }
 }
 
+//  TODO: Enable file logging also
 fn setup_logger() -> Result<(), fern::InitError> {
     // Set up the logger for both stdout and a log file
     Dispatch::new()
@@ -258,7 +269,7 @@ fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .level(LevelFilter::Info)
-        .chain(std::io::stdout())
+        // .chain(std::io::stdout())
         // Output to a log file
         .chain(fern::log_file("output.log")?)
         .apply()?;

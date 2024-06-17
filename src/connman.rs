@@ -11,6 +11,9 @@ use crate::docker;
 use crate::proxy::Proxy;
 use crate::proxy::TlsMsg;
 use crate::proxy::{TcpListener, TlsListener};
+use crate::tui;
+use crate::tui::ProxyInfo;
+use crate::tui::TuiSender;
 
 use highway::HighwayHasher;
 use highway::Key;
@@ -44,6 +47,7 @@ pub struct TlsProxy {
     pub env: Option<Env>,
 }
 
+#[derive(Clone)]
 pub struct TcpPorxy {
     // host address
     pub host: String,
@@ -134,10 +138,13 @@ impl ConnmanBuilder {
             .collect();
 
         let conn = tokio::sync::mpsc::channel(10);
+        let tui = tui::TUI_SENDER.get().cloned();
+
         Ok(Connman {
             tls,
             docker,
             sender: conn.0,
+            tui,
             receiver: Some(conn.1),
         })
     }
@@ -151,6 +158,10 @@ pub struct Connman {
     docker: Vec<DockerBackEnd>,
 
     sender: Sender<Msg>,
+
+    // Sender to communicate with TUI
+    tui: Option<TuiSender>,
+
     receiver: Option<Receiver<Msg>>,
 }
 
@@ -196,13 +207,16 @@ impl Connman {
         let docker = self.get_docker_man();
         let proxy_host = docker.host.clone();
 
+        // Validate if the ImageId is valid and the image is registerd in docker.
+        let image_option = docker.validate_imageid(tcp_option.image.clone()).await?;
+
         let docker_port = docker
             .port_range
             .aquire_port()
             .await
             .ok_or(anyhow!("No port left on docker host"))?;
 
-        // Generate a unique hash for the proxy
+        // Generate a unique name for Container
         use highway::HighwayHash;
         let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
@@ -212,17 +226,18 @@ impl Connman {
             hasher.append(env.key.as_bytes());
             hasher.append(env.value.as_bytes());
         };
-        let name = hasher.finalize64().to_string();
+        let id = hasher.finalize64();
+        let container_name = id.to_string();
 
         let create_option = CreateOption {
             image_id: tcp_option.image,
-            container_name: name,
+            container_name,
             env: tcp_option.env.clone(),
             port: docker_port,
         };
 
         let container_id = docker.create_container(create_option).await?;
-        let proxy_port = tcp_option.listen_port;
+        let proxy_port = docker_port;
         let proxy = Proxy::new(
             container_id,
             proxy_port,
@@ -230,8 +245,9 @@ impl Connman {
             tcp_option.env.clone(),
             docker.sender(),
         );
+        let proxy_id = proxy.id();
 
-        let listener = TcpListener::new(proxy_port, proxy);
+        let listener = TcpListener::new(tcp_option.listen_port, proxy);
         let fut = async {
             listener
                 .run()
@@ -239,6 +255,21 @@ impl Connman {
                 .map_err(|err| error!("Unable to start TcpListener: {err}"))
         };
         tokio::spawn(fut);
+
+        let docker_image = format!("{}:{}", image_option.name, image_option.tag);
+        let proxy_info = ProxyInfo {
+            id: proxy_id.into_inner(),
+            host_port: tcp_option.listen_port,
+            docker_image: docker_image,
+            docker_host: proxy_host,
+            docker_port: proxy_port,
+        };
+
+        if let Some(sender) = &self.tui {
+            let _ = sender
+                .send(tui::Msg::Proxy(proxy_info))
+                .map_err(|err| error!("Unable to send message to TUI: {}", err));
+        }
 
         let url = Url {
             host: tcp_option.host.clone(),
@@ -290,6 +321,7 @@ impl Connman {
                 sender
                     .send(TlsMsg::Add(tls_option.host.clone(), proxy))
                     .await?;
+
                 let url = Url {
                     host: tls_option.host.clone(),
                     port: TLS_PORT,
@@ -372,6 +404,16 @@ impl DockerBackEnd {
             .context("Unable to send docker::Msg::Resgister msg")?;
         Ok(response.1.await??)
     }
+
+    async fn validate_imageid(&self, image_id: ImageId) -> Result<ImageOption> {
+        let response = oneshot::channel();
+        self.sender
+            .send(docker::Msg::GetImageOption(image_id, response.0))
+            .await
+            .context("Unable to send docker::Msg::GetImageOption")?;
+        Ok(response.1.await??)
+    }
+
     fn sender(&self) -> Sender<docker::Msg> {
         self.sender.clone()
     }

@@ -28,8 +28,12 @@ use tokio_rustls::{
 };
 use tracing::span;
 
-use crate::docker::{self, ContainerId, Env};
+use crate::{
+    docker::{self, ContainerId, Env},
+    tui::{self, LogInfo, TuiSender},
+};
 
+pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
 const MAX_TRIES: usize = 100;
 
 enum SuperStream {
@@ -167,10 +171,12 @@ impl TcpListener {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        info!(
+        let info = format!(
             "[{}] Starting TCPListener on Port:\t{}",
             self.proxy.container_id.0, self.listen_port
         );
+        info!("{}", &info);
+        self.proxy.send_tui_log(info);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
@@ -186,10 +192,13 @@ impl TcpListener {
             .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
 
         while let Ok((stream, socket)) = listener.accept().await {
-            info!(
+            let info = format!(
                 "[{}] Got Connection from: {socket}",
                 self.proxy.container_id.0
             );
+            info!("{}", &info);
+            self.proxy.send_tui_log(info);
+
             let stream = SuperStream::Tcp(stream);
             let proxy = self.proxy.clone();
             let fut = async move {
@@ -222,7 +231,18 @@ fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
 }
 
 #[derive(Clone)]
+pub struct ProxyId(u64);
+
+impl ProxyId {
+    pub fn into_inner(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone)]
 pub struct Proxy {
+    // Internal unique identifier for proxy.
+    proxy_id: ProxyId,
     // Internal Id of the container to which the traffic should be
     // proxied.
     container_id: ContainerId,
@@ -238,6 +258,9 @@ pub struct Proxy {
     // Sender to communicate with DockerMan to start
     // containers when a new request is received.
     docker_man: Sender<docker::Msg>,
+
+    // Sender to communicate with TUI.
+    tui: Option<TuiSender>,
 
     // Tracks the number of active connection for this proxy.
     active_connection: ActiveConn,
@@ -257,16 +280,44 @@ impl Proxy {
             container_id.clone(),
         );
 
+        // Generate Unique identifier for the proxy
+        use highway::{HighwayHash, HighwayHasher, Key};
+        let hash_key = Key(HASH_KEY);
+        let mut hasher = HighwayHasher::new(hash_key);
+        hasher.append(&proxy_host.as_bytes());
+        hasher.append(&proxy_port.to_le_bytes());
+        hasher.append(&container_id.0.as_bytes());
+
+        let proxy_id = ProxyId(hasher.finalize64());
+
         let active_connection = conn_track.no_conn();
         tokio::spawn(conn_track.run());
 
+        let tui = tui::TUI_SENDER.get().cloned();
+
         Self {
+            proxy_id,
             container_id,
             proxy_port,
             proxy_host,
             docker_man,
+            tui,
             env,
             active_connection,
+        }
+    }
+
+    pub fn id(&self) -> ProxyId {
+        self.proxy_id.clone()
+    }
+
+    pub fn send_tui_log(&self, log: String) {
+        if let Some(sender) = &self.tui {
+            let log = LogInfo {
+                id: self.id().into_inner(),
+                log,
+            };
+            sender.send(tui::Msg::Log(log));
         }
     }
 
