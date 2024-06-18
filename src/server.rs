@@ -13,12 +13,14 @@ pub mod grpc {
 
 use grpc::conn_man_server::{ConnMan, ConnManServer};
 use grpc::{
-    add_proxy_response, AddProxyRequest, AddProxyResponse, AddTlsListenerRequest,
-    AddTlsListenerResponse, ChallengeType, Proxy, RemoveProxyRequest, RemoveProxyResponse,
+    add_proxy_response, remove_proxy_response, AddProxyRequest, AddProxyResponse,
+    AddTlsListenerRequest, AddTlsListenerResponse, ChallengeType, Proxy, RemoveProxyRequest,
+    RemoveProxyResponse,
 };
 
-use crate::connman::{self, PortRange, TcpPorxy};
+use crate::connman::{self, PortRange, TcpProxy};
 use crate::docker::{Env, ImageId, ImageOption};
+use crate::proxy::ProxyId;
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
@@ -188,8 +190,50 @@ impl ConnMan for ImplConnMan {
         &self,
         request: Request<RemoveProxyRequest>,
     ) -> Result<Response<RemoveProxyResponse>, Status> {
-        todo!()
+        let request: RemoveProxyRequest = request.into_inner();
+
+        // Add the request to the log
+        let r = RequestType::RemoveProxy(request.clone());
+        let _ = self
+            .log
+            .add(r)
+            .await
+            .map_err(|err| error!("Unable to add add_proxy log: {}", err));
+
+        let res = _stop_proxy(&self.connman, request)
+            .await
+            .map_err(|err| {
+                let resp = RemoveProxyResponse {
+                    ok: false,
+                    response: Some(remove_proxy_response::Response::Error(err.to_string())),
+                };
+                Response::new(resp)
+            })
+            .map(|proxy| {
+                let response = RemoveProxyResponse {
+                    ok: true,
+                    response: Some(remove_proxy_response::Response::Id(proxy.into_inner())),
+                };
+                Response::new(response)
+            });
+
+        match res {
+            Ok(res) => return Ok(res),
+            Err(res) => return Ok(res),
+        }
     }
+}
+
+async fn _stop_proxy(
+    connman: &Sender<connman::Msg>,
+    request: RemoveProxyRequest,
+) -> anyhow::Result<ProxyId> {
+    let proxy_id = ProxyId::new(request.id);
+    let channel = oneshot::channel();
+    let msg = connman::Msg::StopProxy(proxy_id, channel.0);
+    connman.send(msg).await?;
+    let proxy_id = channel.1.await??;
+    Ok(proxy_id)
 }
 
 async fn _register_image(
@@ -226,7 +270,7 @@ async fn _add_proxy(
     };
 
     let channel = oneshot::channel();
-    let tcp_proxy = TcpPorxy {
+    let tcp_proxy = TcpProxy {
         // TODO: ??
         host: "0.0.0.0".to_string(),
         listen_port: host_port,
@@ -234,13 +278,14 @@ async fn _add_proxy(
         env,
     };
 
-    let msg = connman::Msg::TcpPorxy(tcp_proxy, channel.0);
+    let msg = connman::Msg::TcpProxy(tcp_proxy, channel.0);
     connman.send(msg).await?;
-    let url = channel.1.await??;
+    let result = channel.1.await??;
+    let url = result.1;
+    let proxy_id = result.0.into_inner();
 
     Ok(Proxy {
-        // TODO: implement logic for id.
-        proxy_id: 0,
+        proxy_id,
         host: url.host,
         port: url.port.to_string(),
     })
@@ -260,6 +305,13 @@ async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
                 let connman = connman.clone();
                 let fut = async move {
                     let res = _add_proxy(&connman, host_port, msg).await;
+                };
+                tokio::spawn(fut);
+            }
+            RequestType::RemoveProxy(msg) => {
+                let connman = connman.clone();
+                let fut = async move {
+                    let res = _stop_proxy(&connman, msg).await;
                 };
                 tokio::spawn(fut);
             }

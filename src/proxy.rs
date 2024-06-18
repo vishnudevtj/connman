@@ -26,6 +26,7 @@ use tokio_rustls::{
     server::TlsStream,
     TlsAcceptor,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::span;
 
 use crate::{
@@ -162,12 +163,18 @@ pub struct TcpListener {
     listen_port: u16,
     // Proxy the connection.
     proxy: Arc<Proxy>,
+    // CancellationToken for shutting down the Listener.
+    cancel: CancellationToken,
 }
 
 impl TcpListener {
-    pub fn new(listen_port: u16, proxy: Proxy) -> Self {
+    pub fn new(listen_port: u16, proxy: Proxy, cancel: CancellationToken) -> Self {
         let proxy = Arc::new(proxy);
-        Self { listen_port, proxy }
+        Self {
+            listen_port,
+            proxy,
+            cancel,
+        }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -191,21 +198,28 @@ impl TcpListener {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
 
-        while let Ok((stream, socket)) = listener.accept().await {
-            let info = format!(
-                "[{}] Got Connection from: {socket}",
-                self.proxy.container_id.0
-            );
-            info!("{}", &info);
-            self.proxy.send_tui_log(info);
+        tokio::select! {
+            Ok((stream, socket))  = listener.accept() => {
+                let info = format!(
+                    "[{}] Got Connection from: {socket}",
+                    self.proxy.container_id.0
+                );
+                info!("{}", &info);
+                self.proxy.send_tui_log(info);
 
-            let stream = SuperStream::Tcp(stream);
-            let proxy = self.proxy.clone();
-            let fut = async move {
-                proxy.run(socket, stream).await;
-            };
-            tokio::spawn(fut);
+                let stream = SuperStream::Tcp(stream);
+                let proxy = self.proxy.clone();
+                let fut = async move {
+                    proxy.run(socket, stream).await;
+                };
+                tokio::spawn(fut);
+            },
+            _ = self.cancel.cancelled() => {
+                info!("Stopping TCPListener on Port: {}", self.listen_port);
+                let _ = self.proxy.cleanup().await.map_err(|err| error!("Proxy Cleanup Failed: {}", err));
+            }
         }
+
         Ok(())
     }
 }
@@ -230,12 +244,18 @@ fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
     Ok(socket)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProxyId(u64);
 
 impl ProxyId {
     pub fn into_inner(&self) -> u64 {
         self.0
+    }
+}
+
+impl ProxyId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
     }
 }
 
@@ -307,6 +327,18 @@ impl Proxy {
         }
     }
 
+    // Does the necessary proxy level cleaup. Including stopping the container and informing TUI.
+    async fn cleanup(&self) -> anyhow::Result<()> {
+        self.docker_man
+            .send(docker::Msg::Stop(self.container_id.clone()))
+            .await?;
+
+        if let Some(sender) = &self.tui {
+            sender.send(tui::Msg::Remove(self.proxy_id.clone()))?;
+        }
+        Ok(())
+    }
+
     pub fn id(&self) -> ProxyId {
         self.proxy_id.clone()
     }
@@ -317,6 +349,7 @@ impl Proxy {
                 id: self.id().into_inner(),
                 log,
             };
+
             sender.send(tui::Msg::Log(log));
         }
     }

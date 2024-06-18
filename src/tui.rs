@@ -22,7 +22,7 @@ use ratatui::{
 use symbols::border;
 use tokio::sync::OnceCell;
 
-use crate::{connman, docker::CONTAINER_NAME_PREFIX};
+use crate::{connman, docker::CONTAINER_NAME_PREFIX, proxy::ProxyId};
 
 pub static TUI_SENDER: OnceCell<Sender<Msg>> = OnceCell::const_new();
 
@@ -33,6 +33,7 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub enum Msg {
     Proxy(ProxyInfo),
+    Remove(ProxyId),
     Log(LogInfo),
 }
 
@@ -105,6 +106,11 @@ impl App {
             }
             Msg::Log(log) => {
                 self.log.0.push(log);
+            }
+            Msg::Remove(proxy_id) => {
+                let id = proxy_id.into_inner();
+                self.proxy.0.retain(|x| x.id != id);
+                self.log.0.retain(|x| x.id != id);
             }
         }
     }

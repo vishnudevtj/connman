@@ -14,7 +14,7 @@ mod proxy;
 mod server;
 mod tui;
 
-use connman::{ConnmanBuilder, TcpPorxy, TlsProxy};
+use connman::{ConnmanBuilder, TcpProxy, TlsProxy};
 use docker::Env;
 
 use fern::Dispatch;
@@ -215,16 +215,17 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
         };
         connman::Msg::TlsProxy(tls_proxy, channel.0)
     } else {
-        let tcp_proxy = TcpPorxy {
+        let tcp_proxy = TcpProxy {
             host: arg.host,
             listen_port,
             image: image_id,
             env,
         };
-        connman::Msg::TcpPorxy(tcp_proxy, channel.0)
+        connman::Msg::TcpProxy(tcp_proxy, channel.0)
     };
     sender.send(msg).await?;
-    let url = channel.1.await??;
+    let result = channel.1.await??;
+    let url = result.1;
     info!("Url: {}:{}", url.host, url.port);
 
     // Wait indefinetly

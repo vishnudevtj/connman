@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::docker::Env;
@@ -9,6 +10,7 @@ use crate::docker::{DockerMan, ImageId};
 
 use crate::docker;
 use crate::proxy::Proxy;
+use crate::proxy::ProxyId;
 use crate::proxy::TlsMsg;
 use crate::proxy::{TcpListener, TlsListener};
 use crate::tui;
@@ -48,7 +50,7 @@ pub struct TlsProxy {
 }
 
 #[derive(Clone)]
-pub struct TcpPorxy {
+pub struct TcpProxy {
     // host address
     pub host: String,
     // Port on proxy host to listen.
@@ -70,9 +72,11 @@ pub struct Url {
 
 pub enum Msg {
     // Deploys a challenge and returns the URL to access it.
-    TlsProxy(TlsProxy, oneshot::Sender<Result<Url>>),
+    TlsProxy(TlsProxy, oneshot::Sender<Result<(ProxyId, Url)>>),
     // Deploys a TCP challenge and retuns host:port.
-    TcpPorxy(TcpPorxy, oneshot::Sender<Result<Url>>),
+    TcpProxy(TcpProxy, oneshot::Sender<Result<(ProxyId, Url)>>),
+    // Shutdown a TcpProxy
+    StopProxy(ProxyId, oneshot::Sender<Result<ProxyId>>),
     // Register a container image on all available docker backend.
     RegisterImage(ImageOption, oneshot::Sender<Result<ImageId>>),
 }
@@ -139,16 +143,20 @@ impl ConnmanBuilder {
 
         let conn = tokio::sync::mpsc::channel(10);
         let tui = tui::TUI_SENDER.get().cloned();
+        let tcp_map = Mutex::new(HashMap::new());
 
         Ok(Connman {
             tls,
             docker,
             sender: conn.0,
             tui,
+            tcp_map,
             receiver: Some(conn.1),
         })
     }
 }
+
+use tokio_util::sync::CancellationToken;
 
 pub struct Connman {
     // Channel to communicate with TLSListener.
@@ -161,6 +169,9 @@ pub struct Connman {
 
     // Sender to communicate with TUI
     tui: Option<TuiSender>,
+
+    // Map containing cancellation tokens to TcpProxy
+    tcp_map: Mutex<HashMap<ProxyId, CancellationToken>>,
 
     receiver: Option<Receiver<Msg>>,
 }
@@ -188,8 +199,13 @@ impl Connman {
                 let r = self.handle_tls_proxy(tls_option).await;
                 let _ = result.send(r);
             }
-            Msg::TcpPorxy(tcp_option, result) => {
+            Msg::TcpProxy(tcp_option, result) => {
                 let r = self.handle_tcp_proxy(tcp_option).await;
+                let _ = result.send(r);
+            }
+            Msg::StopProxy(proxy_id, result) => {
+                // TODO: Handle TLS Proxy also.
+                let r = self.stop_tcp_proxy(proxy_id).await;
                 let _ = result.send(r);
             }
         }
@@ -203,7 +219,16 @@ impl Connman {
         self.receiver.take()
     }
 
-    async fn handle_tcp_proxy(&self, tcp_option: TcpPorxy) -> Result<Url> {
+    async fn stop_tcp_proxy(&self, proxy_id: ProxyId) -> Result<ProxyId> {
+        if let Some(token) = self.tcp_map.lock().await.remove(&proxy_id) {
+            token.cancel();
+            Ok(proxy_id)
+        } else {
+            Err(anyhow!("Invalid ProxyId"))
+        }
+    }
+
+    async fn handle_tcp_proxy(&self, tcp_option: TcpProxy) -> Result<(ProxyId, Url)> {
         let docker = self.get_docker_man();
         let proxy_host = docker.host.clone();
 
@@ -245,9 +270,11 @@ impl Connman {
             tcp_option.env.clone(),
             docker.sender(),
         );
-        let proxy_id = proxy.id();
 
-        let listener = TcpListener::new(tcp_option.listen_port, proxy);
+        let proxy_id = proxy.id();
+        let cancellation_token = CancellationToken::new();
+
+        let listener = TcpListener::new(tcp_option.listen_port, proxy, cancellation_token.clone());
         let fut = async {
             listener
                 .run()
@@ -255,6 +282,14 @@ impl Connman {
                 .map_err(|err| error!("Unable to start TcpListener: {err}"))
         };
         tokio::spawn(fut);
+
+        // Add the cancelation token to the map
+        {
+            self.tcp_map
+                .lock()
+                .await
+                .insert(proxy_id.clone(), cancellation_token);
+        }
 
         let docker_image = format!("{}:{}", image_option.name, image_option.tag);
         let proxy_info = ProxyInfo {
@@ -275,10 +310,10 @@ impl Connman {
             host: tcp_option.host.clone(),
             port: proxy_port,
         };
-        Ok(url)
+        Ok((proxy_id, url))
     }
 
-    async fn handle_tls_proxy(&self, tls_option: TlsProxy) -> Result<Url> {
+    async fn handle_tls_proxy(&self, tls_option: TlsProxy) -> Result<(ProxyId, Url)> {
         let docker = self.get_docker_man();
         let port = docker
             .port_range
@@ -317,6 +352,7 @@ impl Connman {
                     tls_option.env.clone(),
                     docker.sender(),
                 );
+                let proxy_id = proxy.id();
 
                 sender
                     .send(TlsMsg::Add(tls_option.host.clone(), proxy))
@@ -326,7 +362,7 @@ impl Connman {
                     host: tls_option.host.clone(),
                     port: TLS_PORT,
                 };
-                Ok(url)
+                Ok((proxy_id, url))
             }
             None => Err(anyhow!("TLS Listener not configured")),
         }
