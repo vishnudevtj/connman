@@ -7,6 +7,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, Mutex};
 use tonic::{transport::Server, Request, Response, Status};
 
+use anyhow::anyhow;
 pub mod grpc {
     tonic::include_proto!("connman");
 }
@@ -19,12 +20,12 @@ use grpc::{
 };
 
 use crate::connman::{self, PortRange, TcpProxy};
-use crate::docker::{Env, ImageId, ImageOption};
+use crate::docker::{Env, ImageId, ImageOption, ImageRegistry};
 use crate::proxy::ProxyId;
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 enum RequestType {
     AddTlsListener(AddTlsListenerRequest),
     RegisterImage(RegisterImageRequest),
@@ -84,14 +85,20 @@ impl Log {
 pub struct ImplConnMan {
     host_port: PortRange,
     connman: Sender<connman::Msg>,
+    image_registry: ImageRegistry,
     log: Log,
 }
 
 impl ImplConnMan {
-    fn new(connman: Sender<connman::Msg>, db: Log) -> anyhow::Result<Self> {
+    fn new(
+        connman: Sender<connman::Msg>,
+        db: Log,
+        image_registry: ImageRegistry,
+    ) -> anyhow::Result<Self> {
         let host_port = PortRange::new(10_000, 30_000);
         Ok(Self {
             connman,
+            image_registry,
             host_port,
             log: db,
         })
@@ -134,7 +141,7 @@ impl ConnMan for ImplConnMan {
             .map(|id| {
                 let response = RegisterImageResponse {
                     ok: false,
-                    response: Some(register_image_response::Response::Id(id.into_inner())),
+                    response: Some(register_image_response::Response::Id(id.value())),
                 };
 
                 Response::new(response)
@@ -163,22 +170,27 @@ impl ConnMan for ImplConnMan {
             .await
             .map_err(|err| error!("Unable to add add_proxy log: {}", err));
 
-        let res = _add_proxy(&self.connman, host_port, request)
-            .await
-            .map_err(|err| {
-                let resp = AddProxyResponse {
-                    ok: false,
-                    response: Some(add_proxy_response::Response::Error(err.to_string())),
-                };
-                Response::new(resp)
-            })
-            .map(|proxy| {
-                let response = AddProxyResponse {
-                    ok: true,
-                    response: Some(add_proxy_response::Response::Proxy(proxy)),
-                };
-                Response::new(response)
-            });
+        let res = _add_proxy(
+            &self.connman,
+            host_port,
+            request,
+            self.image_registry.clone(),
+        )
+        .await
+        .map_err(|err| {
+            let resp = AddProxyResponse {
+                ok: false,
+                response: Some(add_proxy_response::Response::Error(err.to_string())),
+            };
+            Response::new(resp)
+        })
+        .map(|proxy| {
+            let response = AddProxyResponse {
+                ok: true,
+                response: Some(add_proxy_response::Response::Proxy(proxy)),
+            };
+            Response::new(response)
+        });
 
         match res {
             Ok(res) => return Ok(res),
@@ -261,8 +273,13 @@ async fn _add_proxy(
     connman: &Sender<connman::Msg>,
     host_port: u16,
     request: AddProxyRequest,
+    image_registry: ImageRegistry,
 ) -> anyhow::Result<Proxy> {
-    let image_id = ImageId::from(request.id);
+    let image_id = image_registry
+        .is_valid(request.id)
+        .await
+        .ok_or_else(|| anyhow!("Invalid ImageId"))?;
+
     let env = if let (Some(key), Some(value)) = (request.env_key, request.env_value) {
         Some(Env { key, value })
     } else {
@@ -274,7 +291,7 @@ async fn _add_proxy(
         // TODO: ??
         host: "0.0.0.0".to_string(),
         listen_port: host_port,
-        image: image_id,
+        image_id,
         env,
     };
 
@@ -291,7 +308,11 @@ async fn _add_proxy(
     })
 }
 
-async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
+async fn reply_log(
+    requests: Vec<RequestType>,
+    connman: &Sender<connman::Msg>,
+    image_registry: ImageRegistry,
+) {
     for request in requests {
         match request {
             RequestType::RegisterImage(msg) => {
@@ -303,8 +324,10 @@ async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
             }
             RequestType::AddProxy(msg, host_port) => {
                 let connman = connman.clone();
+                let image_registry = image_registry.clone();
+
                 let fut = async move {
-                    let res = _add_proxy(&connman, host_port, msg).await;
+                    let res = _add_proxy(&connman, host_port, msg, image_registry).await;
                 };
                 tokio::spawn(fut);
             }
@@ -325,12 +348,14 @@ async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
 pub async fn start_grpc(
     addr: SocketAddr,
     docker: Sender<connman::Msg>,
+    image_registry: ImageRegistry,
     database_path: String,
 ) -> anyhow::Result<()> {
     let log = Log::new(database_path)?;
     let messages = log.messages().await?;
-    reply_log(messages, &docker).await;
-    let connman = ImplConnMan::new(docker, log)?;
+    dbg!(&messages);
+    reply_log(messages, &docker, image_registry.clone()).await;
+    let connman = ImplConnMan::new(docker, log, image_registry)?;
     info!("Starting gRPC server on: {}", addr);
     Server::builder()
         .add_service(ConnManServer::new(connman))

@@ -5,7 +5,8 @@ use crate::docker::Env;
 use crate::docker::ImageOption;
 
 use crate::docker::ContainerId;
-use crate::docker::CreateOption;
+use crate::docker::ContainerOption;
+use crate::docker::ImageRegistry;
 use crate::docker::{DockerMan, ImageId};
 
 use crate::docker;
@@ -56,7 +57,7 @@ pub struct TcpProxy {
     // Port on proxy host to listen.
     pub listen_port: u16,
     // Id of the image to deploy for proxying.
-    pub image: ImageId,
+    pub image_id: ImageId,
     // Environment variables for the container.
     pub env: Option<Env>,
 }
@@ -86,6 +87,7 @@ pub struct ConnmanBuilder {
     tls: Option<(Vec<Certificate>, PrivateKey)>,
     // List of docker backend.
     docker: Vec<DockerMan>,
+    image_registry: ImageRegistry,
 }
 
 impl ConnmanBuilder {
@@ -93,6 +95,7 @@ impl ConnmanBuilder {
         Self {
             tls: None,
             docker: Vec::new(),
+            image_registry: ImageRegistry::new(),
         }
     }
 
@@ -102,7 +105,7 @@ impl ConnmanBuilder {
     }
 
     pub fn with_docker(mut self, addr: String, port: u16) -> Result<Self> {
-        let docker_man = DockerMan::new(addr, port)?;
+        let docker_man = DockerMan::new(addr, port, self.image_registry.clone())?;
         self.docker.push(docker_man);
         Ok(self)
     }
@@ -150,6 +153,7 @@ impl ConnmanBuilder {
             docker,
             sender: conn.0,
             tui,
+            image_register: self.image_registry,
             tcp_map,
             receiver: Some(conn.1),
         })
@@ -165,7 +169,8 @@ pub struct Connman {
     // List of all available docker backend.
     docker: Vec<DockerBackEnd>,
 
-    sender: Sender<Msg>,
+    // Registery containning all docker image details.
+    image_register: ImageRegistry,
 
     // Sender to communicate with TUI
     tui: Option<TuiSender>,
@@ -173,6 +178,8 @@ pub struct Connman {
     // Map containing cancellation tokens to TcpProxy
     tcp_map: Mutex<HashMap<ProxyId, CancellationToken>>,
 
+    // Communication channel for the structure
+    sender: Sender<Msg>,
     receiver: Option<Receiver<Msg>>,
 }
 
@@ -192,7 +199,8 @@ impl Connman {
         match msg {
             Msg::RegisterImage(image_option, result) => {
                 let docker = self.get_docker_man();
-                let r = docker.register_image(image_option).await;
+                let image_id = self.image_register.register(image_option).await;
+                let r = docker.pull_image(image_id).await;
                 let _ = result.send(r);
             }
             Msg::TlsProxy(tls_option, result) => {
@@ -219,6 +227,10 @@ impl Connman {
         self.receiver.take()
     }
 
+    pub fn image_registry(&self) -> ImageRegistry {
+        self.image_register.clone()
+    }
+
     async fn stop_tcp_proxy(&self, proxy_id: ProxyId) -> Result<ProxyId> {
         if let Some(token) = self.tcp_map.lock().await.remove(&proxy_id) {
             token.cancel();
@@ -231,9 +243,7 @@ impl Connman {
     async fn handle_tcp_proxy(&self, tcp_option: TcpProxy) -> Result<(ProxyId, Url)> {
         let docker = self.get_docker_man();
         let proxy_host = docker.host.clone();
-
-        // Validate if the ImageId is valid and the image is registerd in docker.
-        let image_option = docker.validate_imageid(tcp_option.image.clone()).await?;
+        let image_option = self.image_register.get(&tcp_option.image_id).await;
 
         let docker_port = docker
             .port_range
@@ -245,17 +255,18 @@ impl Connman {
         use highway::HighwayHash;
         let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
-        hasher.append(&tcp_option.image.into_inner().to_le_bytes());
+        hasher.append(&tcp_option.image_id.value().to_le_bytes());
         hasher.append(&tcp_option.listen_port.to_le_bytes());
         if let Some(env) = tcp_option.env.as_ref() {
             hasher.append(env.key.as_bytes());
             hasher.append(env.value.as_bytes());
         };
+
         let id = hasher.finalize64();
         let container_name = id.to_string();
 
-        let create_option = CreateOption {
-            image_id: tcp_option.image,
+        let create_option = ContainerOption {
+            image_id: tcp_option.image_id,
             container_name,
             env: tcp_option.env.clone(),
             port: docker_port,
@@ -328,7 +339,7 @@ impl Connman {
                 use highway::HighwayHash;
                 let hash_key = Key(HASH_KEY);
                 let mut hasher = HighwayHasher::new(hash_key);
-                hasher.append(&tls_option.image.into_inner().to_le_bytes());
+                hasher.append(&tls_option.image.value().to_le_bytes());
                 hasher.append(tls_option.host.as_bytes());
                 if let Some(env) = tls_option.env.as_ref() {
                     hasher.append(env.key.as_bytes());
@@ -336,7 +347,7 @@ impl Connman {
                 };
                 let name = hasher.finalize64().to_string();
 
-                let create_option = CreateOption {
+                let create_option = ContainerOption {
                     image_id: tls_option.image,
                     container_name: name,
                     env: tls_option.env.clone(),
@@ -432,28 +443,20 @@ struct DockerBackEnd {
 }
 
 impl DockerBackEnd {
-    async fn register_image(&self, image_option: ImageOption) -> Result<ImageId> {
+    async fn pull_image(&self, image_id: ImageId) -> Result<ImageId> {
         let response = oneshot::channel();
         self.sender
-            .send(docker::Msg::Register(image_option, response.0))
+            .send(docker::Msg::Pull(image_id, response.0))
             .await
             .context("Unable to send docker::Msg::Resgister msg")?;
-        Ok(response.1.await??)
-    }
-
-    async fn validate_imageid(&self, image_id: ImageId) -> Result<ImageOption> {
-        let response = oneshot::channel();
-        self.sender
-            .send(docker::Msg::GetImageOption(image_id, response.0))
-            .await
-            .context("Unable to send docker::Msg::GetImageOption")?;
         Ok(response.1.await??)
     }
 
     fn sender(&self) -> Sender<docker::Msg> {
         self.sender.clone()
     }
-    async fn create_container(&self, option: CreateOption) -> Result<ContainerId> {
+
+    async fn create_container(&self, option: ContainerOption) -> Result<ContainerId> {
         let response = oneshot::channel();
         self.sender
             .send(docker::Msg::Create(option, response.0))

@@ -10,6 +10,7 @@ use argh::FromArgs;
 
 mod connman;
 mod docker;
+mod id;
 mod proxy;
 mod server;
 mod tui;
@@ -122,12 +123,11 @@ struct ConnManArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Setup TUI
-
-    tui::tui();
+    // tui::tui();
 
     // Since TUI contains logging we are not enabling stdout logging
     // Enable this if TUI is turned off.
-    // setup_logger()?;
+    setup_logger()?;
 
     let arg: TopLevel = argh::from_env();
     let res = match arg.nested {
@@ -145,11 +145,13 @@ async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
     let sender = connman.sender();
 
     let receiver = connman.receiver().take().unwrap();
+    let image_registry = connman.image_registry();
+
     tokio::spawn(connman.run(receiver));
 
     let addr = format!("{}:{}", arg.host, arg.port).parse()?;
     let db = String::from("database.sqlite");
-    server::start_grpc(addr, sender, db).await
+    server::start_grpc(addr, sender, image_registry, db).await
 }
 
 async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
@@ -218,7 +220,7 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
         let tcp_proxy = TcpProxy {
             host: arg.host,
             listen_port,
-            image: image_id,
+            image_id,
             env,
         };
         connman::Msg::TcpProxy(tcp_proxy, channel.0)
@@ -270,7 +272,7 @@ fn setup_logger() -> Result<(), fern::InitError> {
             ))
         })
         .level(LevelFilter::Info)
-        // .chain(std::io::stdout())
+        .chain(std::io::stdout())
         // Output to a log file
         .chain(fern::log_file("output.log")?)
         .apply()?;

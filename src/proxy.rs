@@ -180,7 +180,7 @@ impl TcpListener {
     pub async fn run(self) -> anyhow::Result<()> {
         let info = format!(
             "[{}] Starting TCPListener on Port:\t{}",
-            self.proxy.container_id.0, self.listen_port
+            self.proxy.container_id, self.listen_port
         );
         info!("{}", &info);
         self.proxy.send_tui_log(info);
@@ -198,29 +198,30 @@ impl TcpListener {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("Unable to create Tokio TCP Listener from socket2 socket.")?;
 
-        tokio::select! {
-            Ok((stream, socket))  = listener.accept() => {
-                let info = format!(
-                    "[{}] Got Connection from: {socket}",
-                    self.proxy.container_id.0
-                );
-                info!("{}", &info);
-                self.proxy.send_tui_log(info);
+        loop {
+            tokio::select! {
+                Ok((stream, socket))  = listener.accept() => {
+                    let info = format!(
+                        "[{}] Got Connection from: {socket}",
+                        self.proxy.container_id
+                    );
+                    info!("{}", &info);
+                    self.proxy.send_tui_log(info);
 
-                let stream = SuperStream::Tcp(stream);
-                let proxy = self.proxy.clone();
-                let fut = async move {
-                    proxy.run(socket, stream).await;
-                };
-                tokio::spawn(fut);
-            },
-            _ = self.cancel.cancelled() => {
-                info!("Stopping TCPListener on Port: {}", self.listen_port);
-                let _ = self.proxy.cleanup().await.map_err(|err| error!("Proxy Cleanup Failed: {}", err));
+                    let stream = SuperStream::Tcp(stream);
+                    let proxy = self.proxy.clone();
+                    let fut = async move {
+                        proxy.run(socket, stream).await;
+                    };
+                    tokio::spawn(fut);
+                },
+                _ = self.cancel.cancelled() => {
+                    info!("Stopping TCPListener on Port: {}", self.listen_port);
+                    let _ = self.proxy.cleanup().await.map_err(|err| error!("Proxy Cleanup Failed: {}", err));
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -306,7 +307,7 @@ impl Proxy {
         let mut hasher = HighwayHasher::new(hash_key);
         hasher.append(&proxy_host.as_bytes());
         hasher.append(&proxy_port.to_le_bytes());
-        hasher.append(&container_id.0.as_bytes());
+        hasher.append(&container_id.value().to_le_bytes());
 
         let proxy_id = ProxyId(hasher.finalize64());
 
@@ -417,7 +418,7 @@ impl Proxy {
                 Ok(proxy_stream) => {
                     info!(
                         "[{}] Proxied Connection after try: {} : {:?}",
-                        container_id.0,
+                        container_id,
                         MAX_TRIES - no_of_try,
                         instant.elapsed()
                     );
@@ -464,7 +465,7 @@ impl Proxy {
         }
         info!(
             "[{}] Connection closed for: {socket} elapsed time {:?}",
-            container_id.0,
+            container_id,
             instant.elapsed()
         );
     }
