@@ -1,5 +1,4 @@
 use std::{
-    default,
     io::{self, stdout, Stdout},
     sync::mpsc::{self, Receiver, Sender},
     thread::spawn,
@@ -11,7 +10,7 @@ use crossterm::{
     execute,
     terminal::*,
 };
-use log::{error, LevelFilter};
+use log::{error};
 use ratatui::{
     prelude::*,
     widgets::{
@@ -22,7 +21,7 @@ use ratatui::{
 use symbols::border;
 use tokio::sync::OnceCell;
 
-use crate::{connman, docker::CONTAINER_NAME_PREFIX, proxy::ProxyId};
+use crate::{docker::CONTAINER_NAME_PREFIX};
 
 pub static TUI_SENDER: OnceCell<Sender<Msg>> = OnceCell::const_new();
 
@@ -75,6 +74,12 @@ pub struct App {
     proxy: ProxyList,
     log: LogList,
     exit: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {

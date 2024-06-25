@@ -3,7 +3,6 @@ use std::{
     fmt::{self, Display},
     hash::Hash,
     hash::Hasher,
-    sync::Arc,
 };
 
 pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
@@ -18,14 +17,11 @@ use bollard::{
     service::{HostConfig, PortBinding},
     Docker, API_DEFAULT_VERSION,
 };
-use highway::HighwayHash;
-use highway::{HighwayHasher, Key};
 use log::{error, info, warn};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
-    oneshot, Mutex,
+    oneshot,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     define_registry,

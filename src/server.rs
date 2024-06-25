@@ -1,14 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{debug, error, info};
+use log::{error, info};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, Mutex};
 use tonic::{transport::Server, Request, Response, Status};
 
-use anyhow::anyhow;
 pub mod grpc {
     tonic::include_proto!("connman");
 }
@@ -16,13 +15,13 @@ pub mod grpc {
 use grpc::conn_man_server::{ConnMan, ConnManServer};
 use grpc::{
     add_proxy_response, remove_proxy_response, AddProxyRequest, AddProxyResponse,
-    AddTlsListenerRequest, AddTlsListenerResponse, ChallengeType, Proxy, RemoveProxyRequest,
+    AddTlsListenerRequest, AddTlsListenerResponse, Proxy, RemoveProxyRequest,
     RemoveProxyResponse,
 };
 
 use crate::connman::{self, Id, PortRange, TcpProxy};
-use crate::docker::{Env, ImageId, ImageOption, ImageRegistry};
-use crate::proxy::{ProxyId, ProxyRegistry};
+use crate::docker::{Env, ImageOption};
+use crate::proxy::{ProxyId};
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
@@ -65,7 +64,7 @@ impl Log {
     async fn add(&self, request: RequestType) -> anyhow::Result<()> {
         let request = serde_json::to_string(&request)?;
         let conn = self.db.lock().await;
-        conn.execute("INSERT INTO log (value) VALUES (?1)", &[&request])?;
+        conn.execute("INSERT INTO log (value) VALUES (?1)", [&request])?;
         Ok(())
     }
 

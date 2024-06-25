@@ -21,7 +21,6 @@ use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc::{self, Receiver, Sender},
-    task,
     time::{sleep, Instant},
 };
 use tokio_rustls::{
@@ -30,7 +29,6 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::span;
 
 use crate::{
     define_registry,
@@ -153,7 +151,6 @@ impl TlsListener {
         match acceptor.accept(stream).await {
             Err(err) => {
                 error!("Unable to accept TLS Stream: {err}");
-                return;
             }
             Ok(stream) => {
                 let (_, connection) = stream.get_ref();

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::docker::Env;
@@ -112,7 +111,7 @@ impl ConnmanBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<Connman> {
-        if self.docker.len() == 0 {
+        if self.docker.is_empty() {
             return Err(anyhow!("No Docker backend configured!"));
         }
         let proxy_registry = ProxyRegistry::new();
@@ -283,7 +282,7 @@ impl Connman {
         let container_name = id.to_string();
 
         let create_option = ContainerOption {
-            image_id: image_id,
+            image_id,
             container_name,
             env: tcp_option.env.clone(),
             port: docker_port,
@@ -321,7 +320,7 @@ impl Connman {
         let proxy_info = ProxyInfo {
             id: proxy_id.value(),
             host_port: tcp_option.listen_port,
-            docker_image: docker_image,
+            docker_image,
             docker_host: proxy_host,
             docker_port: proxy_port,
         };
@@ -370,7 +369,7 @@ impl Connman {
                 let name = hasher.finalize64().to_string();
 
                 let create_option = ContainerOption {
-                    image_id: image_id,
+                    image_id,
                     container_name: name,
                     env: tls_option.env.clone(),
                     port,
@@ -435,7 +434,7 @@ impl PortRange {
         let mut inner = self.inner.lock().await;
         let start = inner.start;
         for (idx, used) in inner.used.iter_mut().enumerate() {
-            if *used != true {
+            if !(*used) {
                 let port = start + idx as u16;
                 *used = true;
                 return Some(port);

@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::BufReader,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -21,12 +20,10 @@ use docker::Env;
 use fern::Dispatch;
 use log::{info, LevelFilter};
 
-use socket2::Socket;
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 use docker::ImageOption;
-use tonic::transport::Server;
 use webpki::EndEntityCert;
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -167,7 +164,7 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
     };
 
     let mut connman = ConnmanBuilder::new();
-    let _msg = if let (Some(c), Some(k)) = (arg.cert, arg.key) {
+    if let (Some(c), Some(k)) = (arg.cert, arg.key) {
         info!("Loading Certificate and Private Key");
         info!("Overriding Listen port to : 443");
         listen_port = 443;
