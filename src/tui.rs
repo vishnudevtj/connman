@@ -33,7 +33,8 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub enum Msg {
     Proxy(ProxyInfo),
-    Remove(ProxyId),
+    // Here the u64 represent the ProxyId,
+    Remove(u64),
     Log(LogInfo),
 }
 
@@ -108,7 +109,7 @@ impl App {
                 self.log.0.push(log);
             }
             Msg::Remove(proxy_id) => {
-                let id = proxy_id.into_inner();
+                let id = proxy_id;
                 self.proxy.0.retain(|x| x.id != id);
                 self.log.0.retain(|x| x.id != id);
             }

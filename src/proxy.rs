@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Arguments,
     marker::Unpin,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
@@ -10,6 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
+use std::hash::Hash;
 
 use log::{error, info, warn};
 use pin_project::pin_project;
@@ -19,6 +21,7 @@ use tokio::{
     io::{copy_bidirectional, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc::{self, Receiver, Sender},
+    task,
     time::{sleep, Instant},
 };
 use tokio_rustls::{
@@ -30,7 +33,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::span;
 
 use crate::{
+    define_registry,
     docker::{self, ContainerId, Env},
+    id::TypedId,
     tui::{self, LogInfo, TuiSender},
 };
 
@@ -43,7 +48,8 @@ enum SuperStream {
 }
 
 pub enum TlsMsg {
-    Add(String, Proxy),
+    Add(String, ProxyId),
+    Remove(ProxyId),
 }
 
 // Listens for TLS stream and proxy the connection.
@@ -60,13 +66,20 @@ pub struct TlsListener {
     key: PrivateKey,
 
     // Mapping between SNI Host name and Proxy
-    map: HashMap<String, Arc<Proxy>>,
+    map: HashMap<String, ProxyId>,
+
+    proxy_registry: ProxyRegistry,
 
     conn: (Sender<TlsMsg>, Receiver<TlsMsg>),
 }
 
 impl TlsListener {
-    pub fn new(listen_port: u16, cert: Vec<Certificate>, key: PrivateKey) -> Self {
+    pub fn new(
+        listen_port: u16,
+        cert: Vec<Certificate>,
+        key: PrivateKey,
+        proxy_registry: ProxyRegistry,
+    ) -> Self {
         let map = HashMap::new();
         let conn = mpsc::channel(10);
         Self {
@@ -75,6 +88,7 @@ impl TlsListener {
             key,
             map,
             conn,
+            proxy_registry,
         }
     }
 
@@ -119,14 +133,18 @@ impl TlsListener {
 
     fn handle_tls_msg(&mut self, msg: TlsMsg) {
         match msg {
-            TlsMsg::Add(host, proxy) => {
+            TlsMsg::Add(host, proxy_id) => {
                 info!("Added host<{}> for proxing by TLSListener", host);
-                self.map.insert(host, Arc::new(proxy));
+                self.map.insert(host, proxy_id);
+            }
+            TlsMsg::Remove(proxy_id) => {
+                // Remove the entry from the map
+                self.map.retain(|_, value| *value != proxy_id);
             }
         }
     }
     async fn handle_connection(
-        &self,
+        &mut self,
         acceptor: &TlsAcceptor,
         stream: TcpStream,
         socket: SocketAddr,
@@ -141,13 +159,18 @@ impl TlsListener {
                 let (_, connection) = stream.get_ref();
                 if let Some(sni) = connection.server_name() {
                     info!("Got Connection with SNI: {sni}");
-                    if let Some(proxy) = self.map.get(sni).cloned() {
+                    if let Some(proxy_id) = self.map.get(sni).cloned() {
                         let stream = SuperStream::Tls(stream);
-                        let fut = async move {
-                            let proxy = proxy;
-                            proxy.run(socket, stream).await;
-                        };
-                        tokio::spawn(fut);
+                        if let Some(proxy) = self.proxy_registry.get(&proxy_id).await {
+                            let fut = async move {
+                                let proxy = proxy;
+                                proxy.run(socket, stream).await;
+                            };
+                            tokio::spawn(fut);
+                        } else {
+                            // Unable to find the particular proxy in proxy_registry. Remove from the mapping.
+                            self.map.retain(|_, value| *value != proxy_id);
+                        }
                     } else {
                         warn!("Unable to find Proxy for SNI: {sni}");
                     }
@@ -168,8 +191,9 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn new(listen_port: u16, proxy: Proxy, cancel: CancellationToken) -> Self {
-        let proxy = Arc::new(proxy);
+    pub fn new(listen_port: u16, proxy: Arc<Proxy>) -> Self {
+        // Cancel the listener when the proxy is also cancelled.
+        let cancel = proxy.cancellation_token.clone();
         Self {
             listen_port,
             proxy,
@@ -177,22 +201,18 @@ impl TcpListener {
         }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        let info = format!(
+    pub async fn run(&self) -> anyhow::Result<()> {
+        self.proxy.tui_log(format_args!(
             "[{}] Starting TCPListener on Port:\t{}",
             self.proxy.container_id, self.listen_port
-        );
-        info!("{}", &info);
-        self.proxy.send_tui_log(info);
+        ));
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
             self.listen_port,
         ));
 
-        let socket = prepare_socket(socket_addr).context(format!(
-            "Unable to create socket for listening on : {socket_addr}"
-        ))?;
+        let socket = prepare_socket(socket_addr)?;
 
         let listener = std::net::TcpListener::from(socket);
         let listener = tokio::net::TcpListener::from_std(listener)
@@ -201,23 +221,21 @@ impl TcpListener {
         loop {
             tokio::select! {
                 Ok((stream, socket))  = listener.accept() => {
-                    let info = format!(
+                    self.proxy.tui_log(format_args!(
                         "[{}] Got Connection from: {socket}",
                         self.proxy.container_id
-                    );
-                    info!("{}", &info);
-                    self.proxy.send_tui_log(info);
+                    ));
 
                     let stream = SuperStream::Tcp(stream);
                     let proxy = self.proxy.clone();
                     let fut = async move {
                         proxy.run(socket, stream).await;
+                        proxy.tui_log(format_args!( "[{}] Closed Connection from: {socket}", proxy.container_id));
                     };
                     tokio::spawn(fut);
                 },
                 _ = self.cancel.cancelled() => {
-                    info!("Stopping TCPListener on Port: {}", self.listen_port);
-                    let _ = self.proxy.cleanup().await.map_err(|err| error!("Proxy Cleanup Failed: {}", err));
+                    self.proxy.tui_log(format_args!("Stopping TCPListener on Port: {}", self.listen_port));
                     return Ok(());
                 }
             }
@@ -245,25 +263,14 @@ fn prepare_socket(socket_addr: SocketAddr) -> anyhow::Result<Socket> {
     Ok(socket)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ProxyId(u64);
+use crate::id::Registry;
 
-impl ProxyId {
-    pub fn into_inner(&self) -> u64 {
-        self.0
-    }
-}
+pub type ProxyId = TypedId<Arc<Proxy>>;
+define_registry!(ProxyRegistry, Arc<Proxy>);
 
-impl ProxyId {
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
-}
-
+// TODO: Arc around Proxy ?
 #[derive(Clone)]
 pub struct Proxy {
-    // Internal unique identifier for proxy.
-    proxy_id: ProxyId,
     // Internal Id of the container to which the traffic should be
     // proxied.
     container_id: ContainerId,
@@ -285,6 +292,10 @@ pub struct Proxy {
 
     // Tracks the number of active connection for this proxy.
     active_connection: ActiveConn,
+
+    // Cancellation token for gracefully shutting down resources associated with the proxy.
+    // Including the Connection Tracker.
+    cancellation_token: CancellationToken,
 }
 
 impl Proxy {
@@ -295,21 +306,14 @@ impl Proxy {
         env: Option<Env>,
         docker_man: Sender<docker::Msg>,
     ) -> Self {
+        let cancellation_token = CancellationToken::new();
+        let child_token = cancellation_token.child_token();
         let conn_track = ConnTrack::new(
             Duration::from_secs(60),
             docker_man.clone(),
             container_id.clone(),
+            child_token,
         );
-
-        // Generate Unique identifier for the proxy
-        use highway::{HighwayHash, HighwayHasher, Key};
-        let hash_key = Key(HASH_KEY);
-        let mut hasher = HighwayHasher::new(hash_key);
-        hasher.append(&proxy_host.as_bytes());
-        hasher.append(&proxy_port.to_le_bytes());
-        hasher.append(&container_id.value().to_le_bytes());
-
-        let proxy_id = ProxyId(hasher.finalize64());
 
         let active_connection = conn_track.no_conn();
         tokio::spawn(conn_track.run());
@@ -317,7 +321,6 @@ impl Proxy {
         let tui = tui::TUI_SENDER.get().cloned();
 
         Self {
-            proxy_id,
             container_id,
             proxy_port,
             proxy_host,
@@ -325,33 +328,40 @@ impl Proxy {
             tui,
             env,
             active_connection,
+            cancellation_token,
         }
     }
 
     // Does the necessary proxy level cleaup. Including stopping the container and informing TUI.
-    async fn cleanup(&self) -> anyhow::Result<()> {
+    // We have this as a seperate funtion because Async Drop is still not supported yet.
+    pub async fn cleanup(&self) -> anyhow::Result<()> {
+        let id = TypedId::<Proxy>::from(self);
         self.docker_man
             .send(docker::Msg::Stop(self.container_id.clone()))
             .await?;
 
         if let Some(sender) = &self.tui {
-            sender.send(tui::Msg::Remove(self.proxy_id.clone()))?;
+            sender.send(tui::Msg::Remove(id.value()))?;
         }
+
+        // Stops the active connection counter.
+        self.cancellation_token.cancel();
         Ok(())
     }
 
-    pub fn id(&self) -> ProxyId {
-        self.proxy_id.clone()
-    }
+    pub fn tui_log(&self, fmt: Arguments<'_>) {
+        let id = TypedId::<Proxy>::from(self);
 
-    pub fn send_tui_log(&self, log: String) {
+        // Print the formatted string as log message
+        let log = format!("{}", fmt);
+        info!("{}", log);
+
         if let Some(sender) = &self.tui {
             let log = LogInfo {
-                id: self.id().into_inner(),
+                id: id.value(),
                 log,
             };
-
-            sender.send(tui::Msg::Log(log));
+            let _ = sender.send(tui::Msg::Log(log));
         }
     }
 
@@ -435,6 +445,7 @@ impl Proxy {
 
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
                         Ok((_to_egress, _to_ingress)) => {
+
                             // info!(
                             //     "Connection {socket} ended gracefully ({to_egress} bytes from client, {to_ingress} bytes from server)"
                             // );
@@ -470,6 +481,27 @@ impl Proxy {
         );
     }
 }
+
+impl Hash for Proxy {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.container_id.hash(state);
+        self.proxy_port.hash(state);
+        self.proxy_host.hash(state);
+        self.env.hash(state);
+    }
+}
+
+impl PartialEq for Proxy {
+    fn eq(&self, other: &Self) -> bool {
+        self.container_id == other.container_id
+            && self.proxy_port == other.proxy_port
+            && self.proxy_host == other.proxy_host
+            && self.env == other.env
+    }
+}
+
+impl Eq for Proxy {}
+
 #[derive(Clone)]
 struct ActiveConn(Arc<AtomicU64>);
 
@@ -516,10 +548,18 @@ struct ConnTrack {
 
     // id of the container that is being tracked
     container_id: ContainerId,
+
+    // Stop the process with the token is cancelled.
+    cancellation_token: CancellationToken,
 }
 
 impl ConnTrack {
-    fn new(timeout: Duration, docker_man: Sender<docker::Msg>, container_id: ContainerId) -> Self {
+    fn new(
+        timeout: Duration,
+        docker_man: Sender<docker::Msg>,
+        container_id: ContainerId,
+        cancellation_token: CancellationToken,
+    ) -> Self {
         let no_conn = ActiveConn::new();
         let interval = Duration::from_secs(5);
         Self {
@@ -528,6 +568,7 @@ impl ConnTrack {
             timeout,
             docker_man,
             container_id,
+            cancellation_token,
         }
     }
 
@@ -539,6 +580,10 @@ impl ConnTrack {
         let mut last_activity = Instant::now();
 
         loop {
+            // Stop the process with the token is cancelled.
+            if self.cancellation_token.is_cancelled() {
+                return;
+            }
             let no_conn = self.no_conn.load();
 
             if no_conn != 0 {

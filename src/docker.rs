@@ -181,15 +181,20 @@ impl DockerMan {
                 }
 
                 Msg::Pull(image_id, response) => {
-                    let image_option = self.image_registry.get(&image_id).await;
-                    let docker = self.docker.clone();
+                    if let Some(image_option) = self.image_registry.get(&image_id).await {
+                        let docker = self.docker.clone();
 
-                    let fut = async move {
-                        let result = DockerMan::check_and_pull_image(&docker, &image_option).await;
-                        let _ = response.send(result);
-                    };
+                        let fut = async move {
+                            let result =
+                                DockerMan::check_and_pull_image(&docker, &image_option).await;
+                            let _ = response.send(result);
+                        };
 
-                    tokio::spawn(fut);
+                        tokio::spawn(fut);
+                    } else {
+                        let result = Err(Error::ImageNotFound);
+                        response.send(result);
+                    }
                 }
                 Msg::Start(id) => {
                     let sender = self.sender();
@@ -251,24 +256,25 @@ impl DockerMan {
         container_registry: ContainerRegistry,
         sender: Sender<Msg>,
     ) {
-        info!("Starting container: {}", id);
-        let container_option = container_registry.get(&id).await;
-        let name = format!(
-            "{}{}",
-            CONTAINER_NAME_PREFIX, container_option.container_name
-        );
+        if let Some(container_option) = container_registry.get(&id).await {
+            let name = format!(
+                "{}{}",
+                CONTAINER_NAME_PREFIX, container_option.container_name
+            );
+            info!("Starting container: {}", &name);
 
-        if docker
-            .start_container(&name, None::<StartContainerOptions<String>>)
-            .await
-            .map_err(|err| error!("Unable to start container: {} : {}", id, err))
-            .is_ok()
-        {
-            let container_status = ContainerStatus {
-                state: ContainerState::Running,
-            };
-            // Update the status of container as running.
-            DockerMan::update_status(sender, id, container_status).await;
+            if docker
+                .start_container(&name, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|err| error!("Unable to start container: {} : {}", id, err))
+                .is_ok()
+            {
+                let container_status = ContainerStatus {
+                    state: ContainerState::Running,
+                };
+                // Update the status of container as running.
+                DockerMan::update_status(sender, id, container_status).await;
+            }
         }
     }
 
@@ -278,26 +284,26 @@ impl DockerMan {
         container_registry: ContainerRegistry,
         sender: Sender<Msg>,
     ) {
-        info!("Stoping container: {}", id);
-        let container_option = container_registry.get(&id).await;
+        if let Some(container_option) = container_registry.get(&id).await {
+            let name = format!(
+                "{}{}",
+                CONTAINER_NAME_PREFIX, container_option.container_name
+            );
 
-        let name = format!(
-            "{}{}",
-            CONTAINER_NAME_PREFIX, container_option.container_name
-        );
+            info!("Stoping container: {}", &name);
+            if docker
+                .stop_container(&name, None::<StopContainerOptions>)
+                .await
+                .map_err(|err| error!("Unable to stop container: {} : {}", id, err))
+                .is_ok()
+            {
+                let container_status = ContainerStatus {
+                    state: ContainerState::Stopped,
+                };
 
-        if docker
-            .stop_container(&name, None::<StopContainerOptions>)
-            .await
-            .map_err(|err| error!("Unable to stop container: {} : {}", id, err))
-            .is_ok()
-        {
-            let container_status = ContainerStatus {
-                state: ContainerState::Stopped,
-            };
-
-            // Update the status of container as stopped.
-            DockerMan::update_status(sender, id, container_status).await;
+                // Update the status of container as stopped.
+                DockerMan::update_status(sender, id, container_status).await;
+            }
         }
     }
 
@@ -308,8 +314,10 @@ impl DockerMan {
         container_registry: ContainerRegistry,
         sender: Sender<Msg>,
     ) -> Result<ContainerId, Error> {
-        let image_option = image_registry.get(&options.image_id).await;
-
+        let image_option = image_registry
+            .get(&options.image_id)
+            .await
+            .ok_or(Error::ImageNotFound)?;
         if DockerMan::check_container(&docker, &options, &image_option).await? {
             info!(
                 "Not creating container<{}> as it already exists",

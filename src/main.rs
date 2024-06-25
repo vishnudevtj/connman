@@ -123,11 +123,11 @@ struct ConnManArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Setup TUI
-    // tui::tui();
+    tui::tui();
 
     // Since TUI contains logging we are not enabling stdout logging
     // Enable this if TUI is turned off.
-    setup_logger()?;
+    // setup_logger()?;
 
     let arg: TopLevel = argh::from_env();
     let res = match arg.nested {
@@ -145,18 +145,17 @@ async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
     let sender = connman.sender();
 
     let receiver = connman.receiver().take().unwrap();
-    let image_registry = connman.image_registry();
 
     tokio::spawn(connman.run(receiver));
 
     let addr = format!("{}:{}", arg.host, arg.port).parse()?;
     let db = String::from("database.sqlite");
-    server::start_grpc(addr, sender, image_registry, db).await
+    server::start_grpc(addr, sender, db).await
 }
 
 async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
     // Setup TUI
-    let tui = tui::tui();
+    tui::tui();
 
     let mut tls_enabled = false;
     let mut listen_port = arg.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);

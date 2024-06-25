@@ -12,6 +12,7 @@ use crate::docker::{DockerMan, ImageId};
 use crate::docker;
 use crate::proxy::Proxy;
 use crate::proxy::ProxyId;
+use crate::proxy::ProxyRegistry;
 use crate::proxy::TlsMsg;
 use crate::proxy::{TcpListener, TlsListener};
 use crate::tui;
@@ -26,10 +27,6 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 
-use rand::rngs::StdRng;
-
-use rand::SeedableRng;
-use tokio::net::unix::SocketAddr;
 use tokio::sync::Mutex;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -45,7 +42,7 @@ pub struct TlsProxy {
     // SNI address for proxying.
     pub host: String,
     // Id of the image to deploy for proxying.
-    pub image: ImageId,
+    pub image: Id,
     // Environment variables for the container.
     pub env: Option<Env>,
 }
@@ -57,7 +54,7 @@ pub struct TcpProxy {
     // Port on proxy host to listen.
     pub listen_port: u16,
     // Id of the image to deploy for proxying.
-    pub image_id: ImageId,
+    pub image_id: Id,
     // Environment variables for the container.
     pub env: Option<Env>,
 }
@@ -71,15 +68,19 @@ pub struct Url {
     pub port: u16,
 }
 
+#[derive(Clone, Copy)]
+pub struct Id(pub u64);
+
+// TODO: Improve Error return. Have a custom type for all defined errors
 pub enum Msg {
-    // Deploys a challenge and returns the URL to access it.
-    TlsProxy(TlsProxy, oneshot::Sender<Result<(ProxyId, Url)>>),
-    // Deploys a TCP challenge and retuns host:port.
-    TcpProxy(TcpProxy, oneshot::Sender<Result<(ProxyId, Url)>>),
-    // Shutdown a TcpProxy
-    StopProxy(ProxyId, oneshot::Sender<Result<ProxyId>>),
-    // Register a container image on all available docker backend.
-    RegisterImage(ImageOption, oneshot::Sender<Result<ImageId>>),
+    // Deploys a challenge and returns the URL to access it along with the Id - ProxyId.
+    TlsProxy(TlsProxy, oneshot::Sender<Result<(Id, Url)>>),
+    // Deploys a TCP challenge and retuns host:port along with the Id - ProxyId.
+    TcpProxy(TcpProxy, oneshot::Sender<Result<(Id, Url)>>),
+    // Shutdown a proxy associated with an id - ProxyId.
+    StopProxy(Id, oneshot::Sender<Result<ProxyId>>),
+    // Register a container image on all available docker backend and returns an Id - ImageId.
+    RegisterImage(ImageOption, oneshot::Sender<Result<Id>>),
 }
 
 pub struct ConnmanBuilder {
@@ -114,8 +115,10 @@ impl ConnmanBuilder {
         if self.docker.len() == 0 {
             return Err(anyhow!("No Docker backend configured!"));
         }
+        let proxy_registry = ProxyRegistry::new();
+
         let tls = self.tls.map(|x| {
-            let listener = TlsListener::new(TLS_PORT, x.0, x.1);
+            let listener = TlsListener::new(TLS_PORT, x.0, x.1, proxy_registry.clone());
             let map = listener.sender();
             let fut = async {
                 listener
@@ -146,7 +149,6 @@ impl ConnmanBuilder {
 
         let conn = tokio::sync::mpsc::channel(10);
         let tui = tui::TUI_SENDER.get().cloned();
-        let tcp_map = Mutex::new(HashMap::new());
 
         Ok(Connman {
             tls,
@@ -154,13 +156,11 @@ impl ConnmanBuilder {
             sender: conn.0,
             tui,
             image_register: self.image_registry,
-            tcp_map,
+            proxy_registry,
             receiver: Some(conn.1),
         })
     }
 }
-
-use tokio_util::sync::CancellationToken;
 
 pub struct Connman {
     // Channel to communicate with TLSListener.
@@ -172,11 +172,11 @@ pub struct Connman {
     // Registery containning all docker image details.
     image_register: ImageRegistry,
 
+    // Registry containning all active proxy
+    proxy_registry: ProxyRegistry,
+
     // Sender to communicate with TUI
     tui: Option<TuiSender>,
-
-    // Map containing cancellation tokens to TcpProxy
-    tcp_map: Mutex<HashMap<ProxyId, CancellationToken>>,
 
     // Communication channel for the structure
     sender: Sender<Msg>,
@@ -200,21 +200,31 @@ impl Connman {
             Msg::RegisterImage(image_option, result) => {
                 let docker = self.get_docker_man();
                 let image_id = self.image_register.register(image_option).await;
-                let r = docker.pull_image(image_id).await;
+                let r = docker.pull_image(image_id).await.map(|x| Id(x.value()));
                 let _ = result.send(r);
             }
             Msg::TlsProxy(tls_option, result) => {
-                let r = self.handle_tls_proxy(tls_option).await;
+                let r = self
+                    .handle_tls_proxy(tls_option)
+                    .await
+                    .map(|x| (Id(x.0.value()), x.1));
                 let _ = result.send(r);
             }
             Msg::TcpProxy(tcp_option, result) => {
-                let r = self.handle_tcp_proxy(tcp_option).await;
+                let r = self
+                    .handle_tcp_proxy(tcp_option)
+                    .await
+                    .map(|x| (Id(x.0.value()), x.1));
                 let _ = result.send(r);
             }
             Msg::StopProxy(proxy_id, result) => {
-                // TODO: Handle TLS Proxy also.
-                let r = self.stop_tcp_proxy(proxy_id).await;
-                let _ = result.send(r);
+                if let Some(proxy_id) = self.proxy_registry.is_valid(proxy_id.0).await {
+                    let r = self.stop_proxy(proxy_id).await;
+                    let _ = result.send(r);
+                } else {
+                    let r = Err(anyhow!("Invalid ProxyId"));
+                    let _ = result.send(r);
+                }
             }
         }
     }
@@ -227,23 +237,29 @@ impl Connman {
         self.receiver.take()
     }
 
-    pub fn image_registry(&self) -> ImageRegistry {
-        self.image_register.clone()
-    }
-
-    async fn stop_tcp_proxy(&self, proxy_id: ProxyId) -> Result<ProxyId> {
-        if let Some(token) = self.tcp_map.lock().await.remove(&proxy_id) {
-            token.cancel();
+    async fn stop_proxy(&self, proxy_id: ProxyId) -> Result<ProxyId> {
+        if let Some(proxy) = self.proxy_registry.remove(&proxy_id).await {
+            proxy.cleanup().await?;
             Ok(proxy_id)
         } else {
-            Err(anyhow!("Invalid ProxyId"))
+            Err(anyhow!("ProxyId not found"))
         }
     }
 
     async fn handle_tcp_proxy(&self, tcp_option: TcpProxy) -> Result<(ProxyId, Url)> {
         let docker = self.get_docker_man();
         let proxy_host = docker.host.clone();
-        let image_option = self.image_register.get(&tcp_option.image_id).await;
+        let image_id = self
+            .image_register
+            .is_valid(tcp_option.image_id.0)
+            .await
+            .ok_or(anyhow!("Invalid ImageId"))?;
+
+        let image_option = self
+            .image_register
+            .get(&image_id)
+            .await
+            .ok_or(anyhow!("Invalid ImageId"))?;
 
         let docker_port = docker
             .port_range
@@ -252,10 +268,11 @@ impl Connman {
             .ok_or(anyhow!("No port left on docker host"))?;
 
         // Generate a unique name for Container
+        // TODO: Use ContainerId value ??
         use highway::HighwayHash;
         let hash_key = Key(HASH_KEY);
         let mut hasher = HighwayHasher::new(hash_key);
-        hasher.append(&tcp_option.image_id.value().to_le_bytes());
+        hasher.append(&tcp_option.image_id.0.to_le_bytes());
         hasher.append(&tcp_option.listen_port.to_le_bytes());
         if let Some(env) = tcp_option.env.as_ref() {
             hasher.append(env.key.as_bytes());
@@ -266,7 +283,7 @@ impl Connman {
         let container_name = id.to_string();
 
         let create_option = ContainerOption {
-            image_id: tcp_option.image_id,
+            image_id: image_id,
             container_name,
             env: tcp_option.env.clone(),
             port: docker_port,
@@ -274,37 +291,35 @@ impl Connman {
 
         let container_id = docker.create_container(create_option).await?;
         let proxy_port = docker_port;
-        let proxy = Proxy::new(
+        let proxy = Arc::new(Proxy::new(
             container_id,
             proxy_port,
             proxy_host.clone(),
             tcp_option.env.clone(),
             docker.sender(),
-        );
+        ));
 
-        let proxy_id = proxy.id();
-        let cancellation_token = CancellationToken::new();
+        let proxy_id = self.proxy_registry.register(proxy.clone()).await;
+        let proxy_registry = self.proxy_registry.clone();
 
-        let listener = TcpListener::new(tcp_option.listen_port, proxy, cancellation_token.clone());
-        let fut = async {
-            listener
+        let listener = TcpListener::new(tcp_option.listen_port, proxy.clone());
+        let proxy_id_1 = proxy_id.clone();
+        let fut = async move {
+            let _ = listener
                 .run()
                 .await
-                .map_err(|err| error!("Unable to start TcpListener: {err}"))
+                .map_err(|err| error!("TcpListener Returned with Error: {err}"));
+
+            // Cleanup Proxy After the listener has stopped working. Remove the proxy from the registry
+            // Also run cleanup routine for the proxy.
+            proxy_registry.remove(&proxy_id_1).await;
+            let _ = proxy.cleanup().await;
         };
         tokio::spawn(fut);
 
-        // Add the cancelation token to the map
-        {
-            self.tcp_map
-                .lock()
-                .await
-                .insert(proxy_id.clone(), cancellation_token);
-        }
-
         let docker_image = format!("{}:{}", image_option.name, image_option.tag);
         let proxy_info = ProxyInfo {
-            id: proxy_id.into_inner(),
+            id: proxy_id.value(),
             host_port: tcp_option.listen_port,
             docker_image: docker_image,
             docker_host: proxy_host,
@@ -326,6 +341,7 @@ impl Connman {
 
     async fn handle_tls_proxy(&self, tls_option: TlsProxy) -> Result<(ProxyId, Url)> {
         let docker = self.get_docker_man();
+
         let port = docker
             .port_range
             .aquire_port()
@@ -336,10 +352,16 @@ impl Connman {
             Some(sender) => {
                 let docker = self.get_docker_man();
 
+                let image_id = self
+                    .image_register
+                    .is_valid(tls_option.image.0)
+                    .await
+                    .ok_or(anyhow!("Invalid ImageId"))?;
+
                 use highway::HighwayHash;
                 let hash_key = Key(HASH_KEY);
                 let mut hasher = HighwayHasher::new(hash_key);
-                hasher.append(&tls_option.image.value().to_le_bytes());
+                hasher.append(&tls_option.image.0.to_le_bytes());
                 hasher.append(tls_option.host.as_bytes());
                 if let Some(env) = tls_option.env.as_ref() {
                     hasher.append(env.key.as_bytes());
@@ -348,7 +370,7 @@ impl Connman {
                 let name = hasher.finalize64().to_string();
 
                 let create_option = ContainerOption {
-                    image_id: tls_option.image,
+                    image_id: image_id,
                     container_name: name,
                     env: tls_option.env.clone(),
                     port,
@@ -356,17 +378,17 @@ impl Connman {
 
                 let container_id = docker.create_container(create_option).await?;
 
-                let proxy = Proxy::new(
+                let proxy = Arc::new(Proxy::new(
                     container_id,
                     port,
                     docker.host.clone(),
                     tls_option.env.clone(),
                     docker.sender(),
-                );
-                let proxy_id = proxy.id();
+                ));
+                let proxy_id = self.proxy_registry.register(proxy.clone()).await;
 
                 sender
-                    .send(TlsMsg::Add(tls_option.host.clone(), proxy))
+                    .send(TlsMsg::Add(tls_option.host.clone(), proxy_id.clone()))
                     .await?;
 
                 let url = Url {

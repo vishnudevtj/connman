@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{error, info};
+use log::{debug, error, info};
 use rusqlite::{Connection, OpenFlags};
+use serde_json::json;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, Mutex};
 use tonic::{transport::Server, Request, Response, Status};
@@ -19,9 +20,9 @@ use grpc::{
     RemoveProxyResponse,
 };
 
-use crate::connman::{self, PortRange, TcpProxy};
+use crate::connman::{self, Id, PortRange, TcpProxy};
 use crate::docker::{Env, ImageId, ImageOption, ImageRegistry};
-use crate::proxy::ProxyId;
+use crate::proxy::{ProxyId, ProxyRegistry};
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
@@ -85,20 +86,14 @@ impl Log {
 pub struct ImplConnMan {
     host_port: PortRange,
     connman: Sender<connman::Msg>,
-    image_registry: ImageRegistry,
     log: Log,
 }
 
 impl ImplConnMan {
-    fn new(
-        connman: Sender<connman::Msg>,
-        db: Log,
-        image_registry: ImageRegistry,
-    ) -> anyhow::Result<Self> {
+    fn new(connman: Sender<connman::Msg>, db: Log) -> anyhow::Result<Self> {
         let host_port = PortRange::new(10_000, 30_000);
         Ok(Self {
             connman,
-            image_registry,
             host_port,
             log: db,
         })
@@ -141,7 +136,7 @@ impl ConnMan for ImplConnMan {
             .map(|id| {
                 let response = RegisterImageResponse {
                     ok: false,
-                    response: Some(register_image_response::Response::Id(id.value())),
+                    response: Some(register_image_response::Response::Id(id)),
                 };
 
                 Response::new(response)
@@ -170,27 +165,22 @@ impl ConnMan for ImplConnMan {
             .await
             .map_err(|err| error!("Unable to add add_proxy log: {}", err));
 
-        let res = _add_proxy(
-            &self.connman,
-            host_port,
-            request,
-            self.image_registry.clone(),
-        )
-        .await
-        .map_err(|err| {
-            let resp = AddProxyResponse {
-                ok: false,
-                response: Some(add_proxy_response::Response::Error(err.to_string())),
-            };
-            Response::new(resp)
-        })
-        .map(|proxy| {
-            let response = AddProxyResponse {
-                ok: true,
-                response: Some(add_proxy_response::Response::Proxy(proxy)),
-            };
-            Response::new(response)
-        });
+        let res = _add_proxy(&self.connman, host_port, request)
+            .await
+            .map_err(|err| {
+                let resp = AddProxyResponse {
+                    ok: false,
+                    response: Some(add_proxy_response::Response::Error(err.to_string())),
+                };
+                Response::new(resp)
+            })
+            .map(|proxy| {
+                let response = AddProxyResponse {
+                    ok: true,
+                    response: Some(add_proxy_response::Response::Proxy(proxy)),
+                };
+                Response::new(response)
+            });
 
         match res {
             Ok(res) => return Ok(res),
@@ -224,7 +214,7 @@ impl ConnMan for ImplConnMan {
             .map(|proxy| {
                 let response = RemoveProxyResponse {
                     ok: true,
-                    response: Some(remove_proxy_response::Response::Id(proxy.into_inner())),
+                    response: Some(remove_proxy_response::Response::Id(proxy.value())),
                 };
                 Response::new(response)
             });
@@ -240,7 +230,7 @@ async fn _stop_proxy(
     connman: &Sender<connman::Msg>,
     request: RemoveProxyRequest,
 ) -> anyhow::Result<ProxyId> {
-    let proxy_id = ProxyId::new(request.id);
+    let proxy_id = Id(request.id);
     let channel = oneshot::channel();
     let msg = connman::Msg::StopProxy(proxy_id, channel.0);
     connman.send(msg).await?;
@@ -251,7 +241,7 @@ async fn _stop_proxy(
 async fn _register_image(
     connman: &Sender<connman::Msg>,
     request: RegisterImageRequest,
-) -> anyhow::Result<ImageId> {
+) -> anyhow::Result<u64> {
     // Register the image.
     let image_option = ImageOption {
         always_pull: true,
@@ -265,20 +255,15 @@ async fn _register_image(
     let msg = connman::Msg::RegisterImage(image_option, channel.0);
     connman.send(msg).await?;
     let image_id = channel.1.await??;
-
-    Ok(image_id)
+    Ok(image_id.0)
 }
 
 async fn _add_proxy(
     connman: &Sender<connman::Msg>,
     host_port: u16,
     request: AddProxyRequest,
-    image_registry: ImageRegistry,
 ) -> anyhow::Result<Proxy> {
-    let image_id = image_registry
-        .is_valid(request.id)
-        .await
-        .ok_or_else(|| anyhow!("Invalid ImageId"))?;
+    let image_id = Id(request.id);
 
     let env = if let (Some(key), Some(value)) = (request.env_key, request.env_value) {
         Some(Env { key, value })
@@ -299,7 +284,7 @@ async fn _add_proxy(
     connman.send(msg).await?;
     let result = channel.1.await??;
     let url = result.1;
-    let proxy_id = result.0.into_inner();
+    let proxy_id = result.0 .0;
 
     Ok(Proxy {
         proxy_id,
@@ -308,35 +293,42 @@ async fn _add_proxy(
     })
 }
 
-async fn reply_log(
-    requests: Vec<RequestType>,
-    connman: &Sender<connman::Msg>,
-    image_registry: ImageRegistry,
-) {
+async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
     for request in requests {
+        info!("Replay: {}", json!(&request));
+        // FIXME: Not sure about the side effets of running the reply parallely. So for the timebeing we
+        // are running it sequentially. Need more testing, feels like there is a potential for race condition.
         match request {
             RequestType::RegisterImage(msg) => {
                 let connman = connman.clone();
                 let fut = async move {
-                    let res = _register_image(&connman, msg).await;
+                    let _ = _register_image(&connman, msg)
+                        .await
+                        .map_err(|err| error!("Replay: Failed to register image: {err}"));
                 };
-                tokio::spawn(fut);
+                fut.await;
+                // tokio::spawn(fut);
             }
             RequestType::AddProxy(msg, host_port) => {
                 let connman = connman.clone();
-                let image_registry = image_registry.clone();
 
                 let fut = async move {
-                    let res = _add_proxy(&connman, host_port, msg, image_registry).await;
+                    let _ = _add_proxy(&connman, host_port, msg)
+                        .await
+                        .map_err(|err| error!("Replay: Failed to Add Proxy: {err}"));
                 };
-                tokio::spawn(fut);
+                fut.await;
+                // tokio::spawn(fut);
             }
             RequestType::RemoveProxy(msg) => {
                 let connman = connman.clone();
                 let fut = async move {
-                    let res = _stop_proxy(&connman, msg).await;
+                    let _ = _stop_proxy(&connman, msg)
+                        .await
+                        .map_err(|err| error!("Replay: Unable to remove proxy: {err}"));
                 };
-                tokio::spawn(fut);
+                fut.await;
+                // tokio::spawn(fut);
             }
             _ => {
                 todo!()
@@ -348,14 +340,12 @@ async fn reply_log(
 pub async fn start_grpc(
     addr: SocketAddr,
     docker: Sender<connman::Msg>,
-    image_registry: ImageRegistry,
     database_path: String,
 ) -> anyhow::Result<()> {
     let log = Log::new(database_path)?;
     let messages = log.messages().await?;
-    dbg!(&messages);
-    reply_log(messages, &docker, image_registry.clone()).await;
-    let connman = ImplConnMan::new(docker, log, image_registry)?;
+    reply_log(messages, &docker).await;
+    let connman = ImplConnMan::new(docker, log)?;
     info!("Starting gRPC server on: {}", addr);
     Server::builder()
         .add_service(ConnManServer::new(connman))

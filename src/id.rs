@@ -64,12 +64,16 @@ impl<T: Hash + Eq + Clone> Registry<T> {
         self.mapping.contains_key(&typed_id).then_some(typed_id)
     }
 
-    pub fn get(&self, id: &TypedId<T>) -> &T {
+    pub fn get(&self, id: &TypedId<T>) -> Option<&T> {
         // TypedId for a structure only exist if the structure is register. Only public
         // function which returns TypedId is is_valid and register both of which make sure
         // it returns only valid Id for a strucure which is already in the map. Thus we can
         // call unwrap here.
-        self.mapping.get(id).unwrap()
+        self.mapping.get(id)
+    }
+
+    pub fn remove(&mut self, id: &TypedId<T>) -> Option<T> {
+        self.mapping.remove(id)
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &TypedId<T>> {
@@ -117,8 +121,13 @@ macro_rules! define_registry {
             }
 
             /// Retrieves an item from the registry by its TypedId.
-            pub async fn get(&self, id: &TypedId<$item_type>) -> $item_type {
-                self.inner.lock().await.get(id).clone()
+            pub async fn get(&self, id: &TypedId<$item_type>) -> Option<$item_type> {
+                self.inner.lock().await.get(id).cloned()
+            }
+
+            /// Retrieves an item from the registry by its TypedId.
+            pub async fn remove(&self, id: &TypedId<$item_type>) -> Option<$item_type> {
+                self.inner.lock().await.remove(id)
             }
 
             /// Checks if a given u64 value corresponds to a valid TypedId in the registry.
