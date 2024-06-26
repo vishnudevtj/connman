@@ -20,7 +20,6 @@ use grpc::{
 
 use crate::connman::{self, Id, PortRange, TcpProxy, TlsProxy};
 use crate::docker::{Env, ImageOption};
-use crate::proxy::ProxyId;
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
@@ -315,7 +314,7 @@ async fn reply_log(
 ) {
     for request in requests {
         info!("Replay: {}", json!(&request));
-        // FIXME: Not sure about the side effets of running the reply parallely. So for the timebeing we
+        // FIXME: Not sure about the side effets of running the reply parallely. So for the time being we
         // are running it sequentially. Need more testing, feels like there is a potential for race condition.
         match request {
             RequestType::RegisterImage(msg) => {
@@ -332,7 +331,7 @@ async fn reply_log(
                 let connman = connman.clone();
 
                 // TODO: will it fail ?
-                host_ports.acquire_port(host_port);
+                let _ = host_ports.acquire_port(host_port);
 
                 let fut = async move {
                     let _ = _add_proxy(&connman, host_port, msg)
@@ -351,9 +350,6 @@ async fn reply_log(
                 };
                 fut.await;
                 // tokio::spawn(fut);
-            }
-            _ => {
-                todo!()
             }
         }
     }

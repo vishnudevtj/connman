@@ -5,8 +5,6 @@ use std::{
     hash::Hasher,
 };
 
-pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
-
 use bollard::{
     auth::DockerCredentials,
     container::{
@@ -49,6 +47,7 @@ impl std::error::Error for Error {}
 
 #[derive(Clone, Debug)]
 pub struct ImageOption {
+    // Connection Type
     // Pull the image even if it exists locally when the
     // image is registered
     pub always_pull: bool,
@@ -101,7 +100,7 @@ enum ContainerState {
     Stopped,
     Running,
 }
-struct ContainerStatus {
+pub struct ContainerStatus {
     // TODO: Collect other metrics and health of the container.
     state: ContainerState,
 }
@@ -119,8 +118,6 @@ pub struct DockerMan {
     // Registry containing details of all container registered in this
     // docker backend.
     container_registry: ContainerRegistry,
-    // Tracks the status of a container in this docker backend.
-    container_status: HashMap<ContainerId, ContainerStatus>,
 
     conn: (Sender<Msg>, Receiver<Msg>),
 }
@@ -132,7 +129,6 @@ impl DockerMan {
         let status = HashMap::new();
         let conn = mpsc::channel(10);
         let container_registry = ContainerRegistry::new();
-        let container_status = HashMap::new();
 
         Ok(Self {
             host,
@@ -140,7 +136,6 @@ impl DockerMan {
             status,
             image_registry: registry,
             container_registry,
-            container_status,
             conn,
         })
     }
@@ -189,7 +184,7 @@ impl DockerMan {
                         tokio::spawn(fut);
                     } else {
                         let result = Err(Error::ImageNotFound);
-                        response.send(result);
+                        let _ = response.send(result);
                     }
                 }
                 Msg::Start(id) => {

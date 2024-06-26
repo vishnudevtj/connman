@@ -79,8 +79,6 @@ pub enum Msg {
     StopProxy(Id, oneshot::Sender<Result<Id>>),
     // Register a container image on all available docker backend and returns an Id - ImageId.
     RegisterImage(ImageOption, oneshot::Sender<Result<Id>>),
-    // Retrive details of a registerd Docker Image
-    GetImage(Id, oneshot::Sender<Result<ImageOption>>),
 }
 
 pub struct ConnmanBuilder {
@@ -234,16 +232,6 @@ impl Connman {
                     let _ = result.send(r);
                 }
             }
-            Msg::GetImage(image_id, result) => {
-                if let Some(image_id) = self.image_register.is_valid(image_id.0).await {
-                    let r = self.image_register.get(&image_id).await.unwrap();
-                    let r = Ok(r);
-                    let _ = result.send(r);
-                } else {
-                    let r = Err(anyhow!("Invalid ImageId"));
-                    let _ = result.send(r);
-                }
-            }
         }
     }
 
@@ -257,6 +245,17 @@ impl Connman {
 
     async fn stop_proxy(&self, proxy_id: ProxyId) -> Result<ProxyId> {
         if let Some(proxy) = self.proxy_registry.remove(&proxy_id).await {
+            if let Some(sender) = &self.tls {
+                let _ = sender
+                    .send(TlsMsg::Remove(proxy_id.clone()))
+                    .await
+                    .map_err(|err| {
+                        error!(
+                            "Stop Proxy: Unable to send message to Tls Listener: {}",
+                            err
+                        )
+                    });
+            }
             proxy.cleanup().await?;
             Ok(proxy_id)
         } else {
@@ -336,9 +335,10 @@ impl Connman {
         tokio::spawn(fut);
 
         let docker_image = format!("{}:{}", image_option.name, image_option.tag);
+        let url = format!("{}:{}", self.proxy_host, tcp_option.listen_port);
         let proxy_info = ProxyInfo {
             id: proxy_id.value(),
-            host_port: tcp_option.listen_port,
+            url,
             docker_image,
             docker_host: proxy_host,
             docker_port: proxy_port,
@@ -352,7 +352,7 @@ impl Connman {
 
         let url = Url {
             host: self.proxy_host.to_string(),
-            port: proxy_port,
+            port: tcp_option.listen_port,
         };
         Ok((proxy_id, url))
     }
@@ -373,6 +373,12 @@ impl Connman {
                 let image_id = self
                     .image_register
                     .is_valid(tls_option.image.0)
+                    .await
+                    .ok_or(anyhow!("Invalid ImageId"))?;
+
+                let image_option = self
+                    .image_register
+                    .get(&image_id)
                     .await
                     .ok_or(anyhow!("Invalid ImageId"))?;
 
@@ -409,6 +415,21 @@ impl Connman {
                 sender
                     .send(TlsMsg::Add(tls_option.host.clone(), proxy_id.clone()))
                     .await?;
+
+                let docker_image = format!("{}:{}", image_option.name, image_option.tag);
+                let proxy_info = ProxyInfo {
+                    id: proxy_id.value(),
+                    url: tls_option.host.clone(),
+                    docker_image,
+                    docker_host: docker.host.clone(),
+                    docker_port: port,
+                };
+
+                if let Some(sender) = &self.tui {
+                    let _ = sender
+                        .send(tui::Msg::Proxy(proxy_info))
+                        .map_err(|err| error!("Unable to send message to TUI: {}", err));
+                }
 
                 let url = Url {
                     host: tls_option.host.clone(),

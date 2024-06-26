@@ -37,7 +37,6 @@ use crate::{
     tui::{self, LogInfo, TuiSender},
 };
 
-pub const HASH_KEY: [u64; 4] = [0xdeadbeef, 0xcafebabe, 0x4242, 0x6969];
 const MAX_TRIES: usize = 100;
 
 enum SuperStream {
@@ -69,6 +68,7 @@ pub struct TlsListener {
     // Mapping between SNI Host name and Proxy
     map: HashMap<String, ProxyId>,
 
+    // Registry containing all active proxy.
     proxy_registry: ProxyRegistry,
 
     conn: (Sender<TlsMsg>, Receiver<TlsMsg>),
@@ -167,7 +167,17 @@ impl TlsListener {
                         if let Some(proxy) = self.proxy_registry.get(&proxy_id).await {
                             let fut = async move {
                                 let proxy = proxy;
+                                proxy.tui_log(format_args!(
+                                    "[{}] Got Connection from: {socket}",
+                                    proxy.container_id
+                                ));
+
                                 proxy.run(socket, stream).await;
+
+                                proxy.tui_log(format_args!(
+                                    "[{}] Closed Connection from: {socket}",
+                                    proxy.container_id
+                                ));
                             };
                             tokio::spawn(fut);
                         } else {
@@ -428,7 +438,7 @@ impl Proxy {
             no_of_try -= 1;
 
             match TcpStream::connect((proxy_host.as_str(), proxy_port)).await {
-                Ok(proxy_stream) => {
+                Ok(mut proxy_stream) => {
                     info!(
                         "[{}] Proxied Connection after try: {} : {:?}",
                         container_id,
@@ -444,7 +454,8 @@ impl Proxy {
                     upstream.set_read_timeout(Some(Duration::from_secs(120)));
                     let mut upstream = Box::pin(upstream);
 
-                    let mut proxy_stream = FlagTransformer::new(flag, proxy_stream);
+                    // Enable this for transforming flags in the stream
+                    // let mut proxy_stream = FlagTransformer::new(flag, proxy_stream);
 
                     match copy_bidirectional(&mut upstream, &mut proxy_stream).await {
                         Ok((_to_egress, _to_ingress)) => {

@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::*,
 };
-use log::{error};
+use log::{error, info};
 use ratatui::{
     prelude::*,
     widgets::{
@@ -21,7 +21,7 @@ use ratatui::{
 use symbols::border;
 use tokio::sync::OnceCell;
 
-use crate::{docker::CONTAINER_NAME_PREFIX};
+use crate::docker::CONTAINER_NAME_PREFIX;
 
 pub static TUI_SENDER: OnceCell<Sender<Msg>> = OnceCell::const_new();
 
@@ -40,7 +40,7 @@ pub enum Msg {
 #[derive(Debug)]
 pub struct ProxyInfo {
     pub id: u64,
-    pub host_port: u16,
+    pub url: String,
     pub docker_image: String,
     pub docker_host: String,
     pub docker_port: u16,
@@ -111,6 +111,7 @@ impl App {
                 self.proxy.0.push(proxy);
             }
             Msg::Log(log) => {
+                info!("{:?}", &log);
                 self.log.0.push(log);
             }
             Msg::Remove(proxy_id) => {
@@ -158,7 +159,7 @@ impl App {
 
         let layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Percentage(40), Constraint::Percentage(60)])
+            .constraints(vec![Constraint::Percentage(50), Constraint::Percentage(50)])
             .margin(2)
             .split(border[0]);
 
@@ -277,14 +278,14 @@ impl ProxyList {
                 proxy.docker_image.clone(),
                 format!(
                     "{} -> {}:{}",
-                    proxy.host_port, proxy.docker_host, proxy.docker_port
+                    proxy.url, proxy.docker_host, proxy.docker_port
                 ),
             ])
         });
         let widths = [
-            Constraint::Percentage(30),
+            Constraint::Percentage(20),
             Constraint::Percentage(40),
-            Constraint::Percentage(30),
+            Constraint::Percentage(40),
         ];
 
         let table = Table::new(rows, widths)
@@ -334,6 +335,5 @@ pub fn tui() {
         let _ = run(app).map_err(|err| error!("TUI returned error: {}", err));
     };
     spawn(function);
-
-    TUI_SENDER.set(sender);
+    let _ = TUI_SENDER.set(sender);
 }
