@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::docker::Env;
@@ -48,8 +49,6 @@ pub struct TlsProxy {
 
 #[derive(Clone)]
 pub struct TcpProxy {
-    // host address
-    pub host: String,
     // Port on proxy host to listen.
     pub listen_port: u16,
     // Id of the image to deploy for proxying.
@@ -77,30 +76,36 @@ pub enum Msg {
     // Deploys a TCP challenge and retuns host:port along with the Id - ProxyId.
     TcpProxy(TcpProxy, oneshot::Sender<Result<(Id, Url)>>),
     // Shutdown a proxy associated with an id - ProxyId.
-    StopProxy(Id, oneshot::Sender<Result<ProxyId>>),
+    StopProxy(Id, oneshot::Sender<Result<Id>>),
     // Register a container image on all available docker backend and returns an Id - ImageId.
     RegisterImage(ImageOption, oneshot::Sender<Result<Id>>),
+    // Retrive details of a registerd Docker Image
+    GetImage(Id, oneshot::Sender<Result<ImageOption>>),
 }
 
 pub struct ConnmanBuilder {
     // Contains TLS certificate and private key for SNI based routing.
-    tls: Option<(Vec<Certificate>, PrivateKey)>,
+    tls: Option<(Vec<Certificate>, PrivateKey, String)>,
     // List of docker backend.
     docker: Vec<DockerMan>,
     image_registry: ImageRegistry,
+
+    // Host address to listen for incomming request.
+    proxy_host: Ipv4Addr,
 }
 
 impl ConnmanBuilder {
-    pub fn new() -> Self {
+    pub fn new(proxy_host: Ipv4Addr) -> Self {
         Self {
             tls: None,
             docker: Vec::new(),
             image_registry: ImageRegistry::new(),
+            proxy_host,
         }
     }
 
-    pub fn with_tls(mut self, cert: Vec<Certificate>, key: PrivateKey) -> Self {
-        self.tls = Some((cert, key));
+    pub fn with_tls(mut self, cert: Vec<Certificate>, key: PrivateKey, host: String) -> Self {
+        self.tls = Some((cert, key, host));
         self
     }
 
@@ -117,7 +122,7 @@ impl ConnmanBuilder {
         let proxy_registry = ProxyRegistry::new();
 
         let tls = self.tls.map(|x| {
-            let listener = TlsListener::new(TLS_PORT, x.0, x.1, proxy_registry.clone());
+            let listener = TlsListener::new(TLS_PORT, x.0, x.1, x.2, proxy_registry.clone());
             let map = listener.sender();
             let fut = async {
                 listener
@@ -156,6 +161,7 @@ impl ConnmanBuilder {
             tui,
             image_register: self.image_registry,
             proxy_registry,
+            proxy_host: self.proxy_host,
             receiver: Some(conn.1),
         })
     }
@@ -176,6 +182,9 @@ pub struct Connman {
 
     // Sender to communicate with TUI
     tui: Option<TuiSender>,
+
+    // Proxy host ip address for listening for incomming connection
+    proxy_host: Ipv4Addr,
 
     // Communication channel for the structure
     sender: Sender<Msg>,
@@ -218,10 +227,20 @@ impl Connman {
             }
             Msg::StopProxy(proxy_id, result) => {
                 if let Some(proxy_id) = self.proxy_registry.is_valid(proxy_id.0).await {
-                    let r = self.stop_proxy(proxy_id).await;
+                    let r = self.stop_proxy(proxy_id).await.map(|x| Id(x.value()));
                     let _ = result.send(r);
                 } else {
                     let r = Err(anyhow!("Invalid ProxyId"));
+                    let _ = result.send(r);
+                }
+            }
+            Msg::GetImage(image_id, result) => {
+                if let Some(image_id) = self.image_register.is_valid(image_id.0).await {
+                    let r = self.image_register.get(&image_id).await.unwrap();
+                    let r = Ok(r);
+                    let _ = result.send(r);
+                } else {
+                    let r = Err(anyhow!("Invalid ImageId"));
                     let _ = result.send(r);
                 }
             }
@@ -332,7 +351,7 @@ impl Connman {
         }
 
         let url = Url {
-            host: tcp_option.host.clone(),
+            host: self.proxy_host.to_string(),
             port: proxy_port,
         };
         Ok((proxy_id, url))
@@ -357,6 +376,7 @@ impl Connman {
                     .await
                     .ok_or(anyhow!("Invalid ImageId"))?;
 
+                // TODO: ??
                 use highway::HighwayHash;
                 let hash_key = Key(HASH_KEY);
                 let mut hasher = HighwayHasher::new(hash_key);
@@ -443,7 +463,24 @@ impl PortRange {
         None
     }
 
-    pub async fn _release_port(&self, port: u16) {
+    pub async fn acquire_port(&self, port: u16) -> Option<u16> {
+        let mut inner = self.inner.lock().await;
+
+        if port < inner.start || port > inner._end {
+            error!("aquire_port({}) : port-out-of-bound", port);
+            return None; // Port is out of range
+        }
+
+        let idx = (port - inner.start) as usize;
+        if !inner.used[idx] {
+            inner.used[idx] = true;
+            Some(port)
+        } else {
+            None // Port is already in use
+        }
+    }
+
+    pub async fn release_port(&self, port: u16) {
         let mut inner = self.inner.lock().await;
         if port > inner._end {
             error!("release_port({}) : Ivalid port given", port);

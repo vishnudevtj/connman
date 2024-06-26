@@ -14,20 +14,18 @@ pub mod grpc {
 
 use grpc::conn_man_server::{ConnMan, ConnManServer};
 use grpc::{
-    add_proxy_response, remove_proxy_response, AddProxyRequest, AddProxyResponse,
-    AddTlsListenerRequest, AddTlsListenerResponse, Proxy, RemoveProxyRequest,
-    RemoveProxyResponse,
+    add_proxy_response, remove_proxy_response, AddProxyRequest, AddProxyResponse, Proxy,
+    RemoveProxyRequest, RemoveProxyResponse,
 };
 
-use crate::connman::{self, Id, PortRange, TcpProxy};
+use crate::connman::{self, Id, PortRange, TcpProxy, TlsProxy};
 use crate::docker::{Env, ImageOption};
-use crate::proxy::{ProxyId};
+use crate::proxy::ProxyId;
 
 use self::grpc::{register_image_response, RegisterImageRequest, RegisterImageResponse};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 enum RequestType {
-    AddTlsListener(AddTlsListenerRequest),
     RegisterImage(RegisterImageRequest),
     // Request and host_port
     AddProxy(AddProxyRequest, u16),
@@ -89,8 +87,7 @@ pub struct ImplConnMan {
 }
 
 impl ImplConnMan {
-    fn new(connman: Sender<connman::Msg>, db: Log) -> anyhow::Result<Self> {
-        let host_port = PortRange::new(10_000, 30_000);
+    fn new(connman: Sender<connman::Msg>, db: Log, host_port: PortRange) -> anyhow::Result<Self> {
         Ok(Self {
             connman,
             host_port,
@@ -101,13 +98,6 @@ impl ImplConnMan {
 
 #[tonic::async_trait]
 impl ConnMan for ImplConnMan {
-    async fn add_tls_listener(
-        &self,
-        request: Request<AddTlsListenerRequest>,
-    ) -> Result<Response<AddTlsListenerResponse>, Status> {
-        todo!();
-    }
-
     async fn register_image(
         &self,
         request: Request<RegisterImageRequest>,
@@ -213,7 +203,7 @@ impl ConnMan for ImplConnMan {
             .map(|proxy| {
                 let response = RemoveProxyResponse {
                     ok: true,
-                    response: Some(remove_proxy_response::Response::Id(proxy.value())),
+                    response: Some(remove_proxy_response::Response::Id(proxy)),
                 };
                 Response::new(response)
             });
@@ -228,13 +218,13 @@ impl ConnMan for ImplConnMan {
 async fn _stop_proxy(
     connman: &Sender<connman::Msg>,
     request: RemoveProxyRequest,
-) -> anyhow::Result<ProxyId> {
+) -> anyhow::Result<u64> {
     let proxy_id = Id(request.id);
     let channel = oneshot::channel();
     let msg = connman::Msg::StopProxy(proxy_id, channel.0);
     connman.send(msg).await?;
     let proxy_id = channel.1.await??;
-    Ok(proxy_id)
+    Ok(proxy_id.0)
 }
 
 async fn _register_image(
@@ -263,7 +253,6 @@ async fn _add_proxy(
     request: AddProxyRequest,
 ) -> anyhow::Result<Proxy> {
     let image_id = Id(request.id);
-
     let env = if let (Some(key), Some(value)) = (request.env_key, request.env_value) {
         Some(Env { key, value })
     } else {
@@ -271,19 +260,46 @@ async fn _add_proxy(
     };
 
     let channel = oneshot::channel();
-    let tcp_proxy = TcpProxy {
-        // TODO: ??
-        host: "0.0.0.0".to_string(),
-        listen_port: host_port,
-        image_id,
-        env,
-    };
 
-    let msg = connman::Msg::TcpProxy(tcp_proxy, channel.0);
-    connman.send(msg).await?;
-    let result = channel.1.await??;
-    let url = result.1;
-    let proxy_id = result.0 .0;
+    use crate::server::grpc::ConnectionType;
+    let connection_type = ConnectionType::try_from(request.connection_type)?;
+    let (proxy_id, url) = match connection_type {
+        ConnectionType::Tcp => {
+            let tcp_proxy = TcpProxy {
+                listen_port: host_port,
+                image_id,
+                env,
+            };
+
+            let msg = connman::Msg::TcpProxy(tcp_proxy, channel.0);
+            connman.send(msg).await?;
+            let result = channel.1.await??;
+            let url = result.1;
+            let proxy_id = result.0 .0;
+            (proxy_id, url)
+        }
+        ConnectionType::Tls => {
+            use rand::prelude::*;
+            use rand_chacha::ChaCha20Rng;
+
+            let seed = host_port as u64;
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            let host = rng.gen::<u64>().to_string();
+
+            let tls_proxy = TlsProxy {
+                host,
+                image: image_id,
+                env,
+            };
+
+            let msg = connman::Msg::TlsProxy(tls_proxy, channel.0);
+            connman.send(msg).await?;
+            let result = channel.1.await??;
+            let url = result.1;
+            let proxy_id = result.0 .0;
+            (proxy_id, url)
+        }
+    };
 
     Ok(Proxy {
         proxy_id,
@@ -292,7 +308,11 @@ async fn _add_proxy(
     })
 }
 
-async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
+async fn reply_log(
+    requests: Vec<RequestType>,
+    connman: &Sender<connman::Msg>,
+    host_ports: PortRange,
+) {
     for request in requests {
         info!("Replay: {}", json!(&request));
         // FIXME: Not sure about the side effets of running the reply parallely. So for the timebeing we
@@ -310,6 +330,9 @@ async fn reply_log(requests: Vec<RequestType>, connman: &Sender<connman::Msg>) {
             }
             RequestType::AddProxy(msg, host_port) => {
                 let connman = connman.clone();
+
+                // TODO: will it fail ?
+                host_ports.acquire_port(host_port);
 
                 let fut = async move {
                     let _ = _add_proxy(&connman, host_port, msg)
@@ -341,10 +364,13 @@ pub async fn start_grpc(
     docker: Sender<connman::Msg>,
     database_path: String,
 ) -> anyhow::Result<()> {
+    // We will be using port range from 10_000 to 30_000 on the host for proxying
+    let host_port = PortRange::new(10_000, 30_000);
+
     let log = Log::new(database_path)?;
     let messages = log.messages().await?;
-    reply_log(messages, &docker).await;
-    let connman = ImplConnMan::new(docker, log)?;
+    reply_log(messages, &docker, host_port.clone()).await;
+    let connman = ImplConnMan::new(docker, log, host_port)?;
     info!("Starting gRPC server on: {}", addr);
     Server::builder()
         .add_service(ConnManServer::new(connman))

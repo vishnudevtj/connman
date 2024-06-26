@@ -63,6 +63,9 @@ pub struct TlsListener {
     // Private Key for the certificate
     key: PrivateKey,
 
+    // Host address of the wild card certificate
+    host: String,
+
     // Mapping between SNI Host name and Proxy
     map: HashMap<String, ProxyId>,
 
@@ -76,6 +79,7 @@ impl TlsListener {
         listen_port: u16,
         cert: Vec<Certificate>,
         key: PrivateKey,
+        host: String,
         proxy_registry: ProxyRegistry,
     ) -> Self {
         let map = HashMap::new();
@@ -86,6 +90,7 @@ impl TlsListener {
             key,
             map,
             conn,
+            host,
             proxy_registry,
         }
     }
@@ -95,7 +100,7 @@ impl TlsListener {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
-        info!("Starting TLSListener on Port:\t\t{}", self.listen_port);
+        info!("Starting TLSListener on Port: {}", self.listen_port);
 
         let socket_addr = SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::new(0, 0, 0, 0),
@@ -132,8 +137,9 @@ impl TlsListener {
     fn handle_tls_msg(&mut self, msg: TlsMsg) {
         match msg {
             TlsMsg::Add(host, proxy_id) => {
-                info!("Added host<{}> for proxing by TLSListener", host);
-                self.map.insert(host, proxy_id);
+                let sni = format!("{}.{}", host, self.host);
+                info!("Added host<{}> for proxing by TLSListener", sni);
+                self.map.insert(sni, proxy_id);
             }
             TlsMsg::Remove(proxy_id) => {
                 // Remove the entry from the map

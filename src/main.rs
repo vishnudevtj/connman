@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -20,7 +21,8 @@ use docker::Env;
 use fern::Dispatch;
 use log::{info, LevelFilter};
 
-use tokio::sync::oneshot;
+use rustls_pki_types::Ipv4Addr;
+use tokio::{sync::oneshot, time::sleep};
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 use docker::ImageOption;
@@ -50,6 +52,11 @@ struct GrpcArg {
     #[argh(option, short = 'h', default = "String::from(\"0.0.0.0\")")]
     host: String,
 
+    /// on which address to listen for proxying requests. This value is returns as
+    /// url for TCP connection type
+    #[argh(option)]
+    proxy_host: String,
+
     /// host port on which to start gRPC server
     #[argh(option, short = 'p', default = "50051")]
     port: u16,
@@ -62,6 +69,14 @@ struct GrpcArg {
     /// listens
     #[argh(option)]
     docker_port: u16,
+
+    /// cert file
+    #[argh(option, short = 'c')]
+    cert: Option<PathBuf>,
+
+    /// key file
+    #[argh(option)]
+    key: Option<PathBuf>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -120,11 +135,13 @@ struct ConnManArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Setup TUI
-    tui::tui();
+    // tui::tui();
 
+    // \_(ツ)_/
+    // sleep(Duration::from_secs(2)).await;
     // Since TUI contains logging we are not enabling stdout logging
     // Enable this if TUI is turned off.
-    // setup_logger()?;
+    setup_logger()?;
 
     let arg: TopLevel = argh::from_env();
     let res = match arg.nested {
@@ -135,7 +152,31 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_grpc(arg: GrpcArg) -> anyhow::Result<()> {
-    let connman = ConnmanBuilder::new();
+    let proxy_host = arg.proxy_host.parse()?;
+    let mut connman = ConnmanBuilder::new(proxy_host);
+
+    if let (Some(c), Some(k)) = (arg.cert, arg.key) {
+        info!("Loading Certificate and Private Key");
+        let mut tls_host = String::new();
+        let cert = load_certificates_from_pem(&c)?;
+        let key = load_private_key_from_file(&k)?;
+        for c in cert.iter() {
+            let cert_der = c.as_ref();
+            let cert = EndEntityCert::try_from(cert_der)?;
+            for dns_name in cert.dns_names()? {
+                let name: &str = dns_name.into();
+                if let Some(host) = name.strip_prefix("*.") {
+                    info!("Got a Wild Card Certificate for DNS Host: {}", host);
+                    tls_host = host.to_string();
+                }
+            }
+        }
+
+        if tls_host.len() > 0 {
+            connman = connman.with_tls(cert, key, tls_host);
+        }
+    };
+
     // Add docker backend.
     let connman = connman.with_docker(arg.docker_host, arg.docker_port)?;
     let mut connman = connman.build()?;
@@ -163,7 +204,8 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
         None
     };
 
-    let mut connman = ConnmanBuilder::new();
+    let proxy_host = std::net::Ipv4Addr::from([0, 0, 0, 0]);
+    let mut connman = ConnmanBuilder::new(proxy_host);
     if let (Some(c), Some(k)) = (arg.cert, arg.key) {
         info!("Loading Certificate and Private Key");
         info!("Overriding Listen port to : 443");
@@ -178,7 +220,8 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
                 info!("Got Certificate for DNS: {}", name);
             }
         }
-        connman = connman.with_tls(cert, key);
+        // TODO: Fix adding hostname to  tls
+        connman = connman.with_tls(cert, key, String::new());
         tls_enabled = true;
     };
 
@@ -214,7 +257,6 @@ async fn start_cli(arg: ConnManArg) -> anyhow::Result<()> {
         connman::Msg::TlsProxy(tls_proxy, channel.0)
     } else {
         let tcp_proxy = TcpProxy {
-            host: arg.host,
             listen_port,
             image_id,
             env,

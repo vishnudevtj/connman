@@ -3,10 +3,6 @@ syntax = "proto3";
 package connman;
 
 service ConnMan {
-    // Add a TLS Listener. It is possible to host multiple web challenges on a TLS listener.
-    // If the provided with a TLS certificate wildcard certificate.
-    rpc AddTLSListener(AddTLSListenerRequest) returns (AddTLSListenerResponse) {}
-
     // Registers a image and returns an Id. This allows us to pull images ahead of time.
     rpc RegisterImage(RegisterImageRequest) returns (RegisterImageResponse) {}
 
@@ -16,30 +12,9 @@ service ConnMan {
     rpc RemoveProxy(RemoveProxyRequest) returns (RemoveProxyResponse) {}
 }
 
-message AddTLSListenerRequest {
-    int32 port  = 1;
-    string cert_file = 2;
-    string key_file  = 3;
-}
-
-message AddTLSListenerResponse {
-    bool ok = 1;
-    oneof response {
-        uint64 id = 2;
-        string error = 3;
-    }
-}
-
-// If an TLS listener with wild card certificate is available. 
-// The web challenge will be hosted on it.
-enum ChallengeType {
-    PWN = 0;
-    WEB = 1;
-}
 
 // TODO: Pass on registry credentials
 message RegisterImageRequest {
-    ChallengeType type = 1;
     string image = 2;
     string tag = 3;
     // Port which the image exposes
@@ -54,11 +29,21 @@ message RegisterImageResponse {
     }
 }
 
+// Wether to use TLS or TCP Listener for incomming requests
+// TLS Listener will only be used if the service was started 
+// with a wild card certificate
+enum ConnectionType {
+    Tls = 0;
+    Tcp = 1;
+}
+
 // TODO: Requires challenge resource allocation metrics.
 message AddProxyRequest {
     uint64 id = 1;
-    optional string env_key = 2;
-    optional string env_value = 3;
+    ConnectionType connection_type = 2;
+
+    optional string env_key = 3;
+    optional string env_value = 4;
 }
 
 message Proxy {
