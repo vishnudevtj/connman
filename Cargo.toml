@@ -19,7 +19,6 @@ pin-project = "1.1.3"
 prost = "0.12.4"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
-ratatui = "0.26.3"
 rusqlite = "0.31.0"
 rustls-pemfile = "1.0.3"
 rustls-pki-types = "0.2.1"
@@ -33,7 +32,9 @@ tokio-rustls = "0.24.1"
 tokio-util = "0.7.11"
 tonic = "0.11.0"
 tracing = "0.1.40"
-tui-logger = { version = "0.11.1", features = ["tracing", "crossterm"] }
+
+ratatui = "0.29"
+tui-logger = { version = "0.14.1", features = ["tracing", "crossterm"] }
 
 [build-dependencies]
 tonic-build = "0.11.0"
